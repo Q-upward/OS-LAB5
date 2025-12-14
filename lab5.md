@@ -212,7 +212,8 @@
 
 实验结果表明，用户进程的创建流程、地址空间复制以及中断上下文设置均符合预期，验证了本练习实现的正确性。
 
-![alt text](image.png)
+<img width="621" height="318" alt="image" src="https://github.com/user-attachments/assets/1cf87ed4-91cd-472b-b166-c5acf1b4eb02" />
+
 
 ### 五、小结
 
