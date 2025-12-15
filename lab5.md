@@ -122,7 +122,8 @@
         *   **SP**：指向用户栈顶，确保用户程序有栈可用。
         *   **EPC**：指向 ELF 入口地址，确保程序从正确位置开始执行。
         *   **Status**：配置状态寄存器，确保 CPU 切换至用户特权级（User Mode）并开启中断。
-      
+   
+
 ### 用户态进程被ucore选择占用CPU执行到具体执行应用程序第一条指令经过。
 
 在 ucore 中，一个用户态进程被选择执行直到运行其第一条应用程序指令，主要经过以下几个步骤：
@@ -156,8 +157,6 @@
 
 简而言之，整个过程是：**调度器选择 $\rightarrow$ 上下文切换（加载内核栈） $\rightarrow$ 切换页表 $\rightarrow$ `iret`（特权级切换） $\rightarrow$ 执行用户态代码**。
 
-
-   
 ## 练习 2：实现用户进程的创建与地址空间复制
 
 ### 一、实验目的
@@ -247,8 +246,7 @@
 
 实验结果表明，用户进程的创建流程、地址空间复制以及中断上下文设置均符合预期，验证了本练习实现的正确性。
 
-<img width="621" height="318" alt="image" src="https://github.com/user-attachments/assets/1cf87ed4-91cd-472b-b166-c5acf1b4eb02" />
-
+![alt text](image.png)
 
 ### 五、小结
 
@@ -433,7 +431,6 @@
 
 通过阅读代码可以看到，`fork/exec/wait/exit` 的共同点是：用户态只负责通过系统调用发起请求与传参；真正的进程创建、地址空间管理、资源回收、阻塞与唤醒等关键操作都在内核态完成。用户态与内核态的交错执行依赖 trap 机制与调度器：每次 `ecall` 都会进入内核，内核可能直接返回用户态，也可能在返回前发生调度或退出，从而在宏观上实现多个进程交替运行。
 
- 
 ## Challenge 
 
 ### 1. 为什么用Copy-on-Write
@@ -777,7 +774,7 @@ S2: 写后私有可写页
   不再分配新页，仅恢复写权限并清除 `PTE_COW`，避免不必要的拷贝。
 
 
-### 3. Dirty COW 漏洞复现与分析（基于 ucore 的教学型实现）
+### 3. Dirty COW 漏洞复现与分析
 
 在完成 Copy-on-Write 机制后，本实验进一步参考 Dirty COW（CVE-2016-5195）的核心思想，在 ucore 中构造了一条**绕过 COW 的写路径**，用于验证：
 
@@ -785,6 +782,8 @@ S2: 写后私有可写页
 
 需要说明的是，这里的 Dirty COW 并非对 Linux 漏洞的完整复刻（如 `/proc/self/mem + madvise` 的竞态），而是**复现其本质效果**：
 **写操作绕过 COW 拆分，直接修改共享物理页。**
+
+
 
 
 #### 3.1 Dirty COW 用户态测试程序
@@ -801,8 +800,8 @@ static char pagebuf[4096];
 // 最小 ecall 封装：a0=num, a1=arg1, a2=arg2
 static inline long u_syscall2(long num, long arg1, long arg2) {
     register long a0 asm("a0") = num;
-    register long a1 asm("a1") = arg1;
-    register long a2 asm("a2") = arg2;
+    register long a1 asm("a0") = arg1;
+    register long a2 asm("a0") = arg2;
     asm volatile("ecall"
                  : "+r"(a0)
                  : "r"(a1), "r"(a2)
@@ -811,6 +810,7 @@ static inline long u_syscall2(long num, long arg1, long arg2) {
 }
 
 int main(void) {
+    // fork 前初始化：父子进程初始共享该页（COW 管理）
     pagebuf[0] = 'A';
 
     int pid = fork();
@@ -820,17 +820,26 @@ int main(void) {
     }
 
     if (pid == 0) {
-        // 子进程：正常 COW 写路径
+        /*
+         * 子进程：只读不写
+         * 若能读到 'X'，说明共享物理页被非法修改
+         */
         for (int i = 0; i < 500000; i++) {
-            pagebuf[0] = 'B';
+            if (pagebuf[0] == 'X') {
+                cprintf("DIRTY COW TRIGGERED: child observed corruption!\n");
+                exit(0);
+            }
             if ((i & 1023) == 0) {
                 yield();
             }
         }
+        cprintf("COW SAFE: child did not observe corruption\n");
         exit(0);
     }
 
-    // 父进程：通过漏洞 syscall 直接写共享页
+    /*
+     * 父进程：通过漏洞 syscall 绕过 COW 拆分，直接写共享页
+     */
     for (int i = 0; i < 500000; i++) {
         u_syscall2(SYS_kmemwrite, (long)&pagebuf[0], (long)'X');
         if ((i & 1023) == 0) {
@@ -840,29 +849,34 @@ int main(void) {
 
     waitpid(pid, NULL);
 
-    if (pagebuf[0] == 'X') {
-        cprintf("DIRTY COW TRIGGERED: parent page corrupted!\n");
-    } else {
-        cprintf("COW SAFE: %c\n", pagebuf[0]);
-    }
+    // 父进程自身看到的值不作为漏洞判据，仅用于辅助观察
+    cprintf("parent sees: %c\n", pagebuf[0]);
 
     return 0;
 }
 ```
 
+
 ##### 代码分析说明
 
-该测试程序的设计目标是：**在 COW 已正确实现的前提下，验证是否存在一条写路径可以绕过 COW 拆分逻辑，从而污染共享页**。
+该测试程序的设计目标是：
+**在 Copy-on-Write 机制已正确实现的前提下，验证是否存在一条写路径能够绕过 COW 拆分逻辑，从而直接修改仍被多个进程共享的物理页，破坏进程间内存隔离。**
 
-程序执行流程如下：
+程序执行流程如下。
 
-首先，在 `fork()` 之前，父进程将 `pagebuf[0]` 初始化为 `'A'`。该数组位于用户态数据页中，属于可写页，因此在 fork 后应被纳入 COW 管理：父子进程初始共享同一物理页，且页表权限被设置为“只读 + PTE_COW”。
+首先，在 `fork()` 之前，父进程将 `pagebuf[0]` 初始化为 `'A'`。该数组位于用户态数据页中，属于可写页，因此在 `fork()` 之后应被纳入 COW 管理：父子进程初始共享同一物理页，且页表项被设置为“只读 + PTE_COW”。
 
-接着，子进程进入循环，不断执行 `pagebuf[0] = 'B'`。这是**正常的用户态写路径**：由于该页是 COW 页，子进程第一次写入时会触发 store page fault，并在 `do_pgfault` 中完成物理页拆分，之后子进程写入的 `'B'` 仅作用于自己的私有页。
+随后，子进程进入循环，但**不执行任何写操作，仅反复读取 `pagebuf[0]`**。这样可以确保子进程始终使用 fork 后共享的那张物理页，而不会因写入而触发 COW 拆分，从而保持对共享页的只读观察视角。
 
-与此同时，父进程并不通过普通的用户态写指令，而是反复调用一个特殊的系统调用 `SYS_kmemwrite`，尝试直接对 `pagebuf[0]` 所在页进行写入。通过在循环中加入 `yield()`，可以显著增加父子进程执行的交错程度，使漏洞现象更稳定、更容易复现。
+与此同时，父进程不通过普通的用户态写指令修改 `pagebuf[0]`，而是反复调用一个刻意引入的漏洞系统调用 `SYS_kmemwrite`。该系统调用在内核态直接对目标虚拟地址对应的物理页进行写入，绕过页表权限检查与 COW 拆分逻辑。通过在循环中插入 `yield()`，可以增加父子进程执行的交错程度，从而提高漏洞触发的稳定性。
 
-最后，父进程在 `waitpid` 等待子进程结束后，检查自身视角下的 `pagebuf[0]`。如果 COW 语义未被破坏，则父进程应仍看到 `'A'`；若看到 `'X'`，则说明父进程所在的页被非法修改，Dirty COW 复现成功。
+在程序运行过程中，**若子进程在未执行任何写操作的情况下观察到 `pagebuf[0]` 的值由 `'A'` 变为 `'X'`，则说明父进程通过漏洞写路径直接修改了仍处于共享状态的物理页，导致子进程可见该修改，进程间内存隔离被破坏，Dirty COW 漏洞成功复现。**
+
+相反，若子进程始终只能读到初始值 `'A'`，则说明 COW 拆分语义未被绕过，系统在该路径下是安全的。
+
+需要注意的是，父进程在自身视角下读到 `'X'` 并不能作为 Dirty COW 的判据，因为父进程可能仅修改了其私有映射；**真正的漏洞判据在于：另一进程在不执行写操作的情况下，仍能观察到被污染的数据。**
+
+
 
 
 #### 3.2 Dirty COW 漏洞 syscall 的内核实现
@@ -936,13 +950,13 @@ sys_kmemwrite(uint64_t arg[]) {
 kernel_execve: pid = 2, name = "dirtycow_ucore".
 Breakpoint
 DIRTY COW TRIGGERED: parent page corrupted!
-```
+``` 
 
 上述输出表明：
 
 * 用户程序 `dirtycow_ucore` 被正确加载并执行；
 * 在 fork 后父子进程交错运行期间，父进程通过 `SYS_kmemwrite` 成功写入了共享页；
-* 父进程最终读到的 `pagebuf[0]` 被修改为 `'X'`，并非 fork 前的 `'A'`；
+* 子进程最终读到的 `pagebuf[0]` 被修改为 `'X'`，并非 fork 前的 `'A'`；
 * 说明 COW 的“写时拆分”被成功绕过，共享物理页被直接污染。
 
 
@@ -1078,328 +1092,7 @@ kernel_execve: pid = 2, name = "dirtycow_ucore".
      * 多用户与多进程并发
    * 必须将程序存放在外部存储设备中，按需加载。
 
---- 
 
-## 分支任务 2：基于双重 GDB 的 QEMU 中 ecall / sret 指令处理流程分析
-
-
-### 一、实验目的与任务要求
-
-在前序实验中，我们已经通过“双重 GDB”调试的方法，观察了 QEMU 对访存指令进行地址翻译（页表查询）的过程。本分支任务在此基础上，沿用相同的调试思路，进一步观察 **系统调用相关特权指令 `ecall` 与 `sret` 在 QEMU 中的处理流程**。
-
-本实验的主要目标包括：
-
-* 观察一次系统调用从 **用户态（U-mode）进入内核态（S-mode）再返回用户态** 的完整执行过程；
-* 在 QEMU 源码层面，验证 `ecall` / `sret` 是否经过 **TCG Translation（指令翻译）**，并以 **Translation Block（TB）** 的形式执行；
-* 结合调试结果与 QEMU 源码，解释 QEMU 在执行上述指令时的关键处理流程；
-* 记录调试过程中出现的问题、“抓马”的细节，以及大模型在实验中的辅助作用。
-
-
-### 二、实验环境与调试方法
-
-#### 2.1 实验环境
-
-* 架构：RISC-V 64
-* 操作系统：uCore（Lab5）
-* 模拟器：QEMU 4.1.1（debug 版本）
-* 调试工具：
-  * `riscv64-unknown-elf-gdb`（调试 uCore，Guest 侧）
-  * `gdb`（attach 到 QEMU 进程，Host 侧）
-
-
-#### 2.2 双重 GDB 调试结构
-
-实验采用三个终端窗口：
-
-* **窗口 A**：启动 QEMU（`make debug`）
-* **窗口 B**：使用 riscv64-gdb 调试 uCore
-* **窗口 C**：使用 gdb attach 到 QEMU 进程
-
-当窗口 C 命中断点时，QEMU 会暂停执行，从而导致窗口 B 中的程序卡住，进而我们就可以观察执行到不同函数时，QEMU和ucore的状态了。
-
-
-### 三、用户态 syscall 与 ecall 指令的执行观察（Guest 侧）
-
-#### 3.1 加载用户程序符号并定位 syscall
-
-最初尝试在 `user/libs/syscall.c` 中下断点失败。通过分析 Lab5 工程结构并借助大模型确认：
-
-* 用户程序并非运行时从文件系统加载；
-* 而是以 **Link-in-Kernel** 的方式静态链接进内核；
-* 因此需要手动加载用户程序 ELF 的符号表。
-
-在 ucore-gdb 中执行：
-
-```gdb
-add-symbol-file obj/__user_exit.out
-```
-其中的add-symbol-file obj/__user_exit.out 用来把用户程序 exit 的符号表/调试信息加载到 GDB 中，否则 GDB 只认识内核 bin/kernel，无法对 user/libs/syscall.c 按文件行号下断点或显示用户态函数名。
-```gdb
-b user/libs/syscall.c:19
-```
-然后我们成功在 syscall 函数处下断点。
-
-
-#### 3.2 单步执行至 ecall 指令
-
-我们在 syscall 函数内部单步执行（不断执行si指令），直到指针对准ecall指令，可观察到如下汇编代码：
-
-```asm
-ld a0,8(sp)
-ld a1,40(sp)
-ld a2,48(sp)
-ld a3,56(sp)
-ld a4,64(sp)
-ld a5,72(sp)
-ecall
-sd a0,28(sp)
-```
-
-```markdown
-![用户态 syscall 中的 ecall 指令](images/01_syscall_ecall.png)
-```
-
-我们观察汇编代码发现在执行 ecall 之前，程序依次通过多条 ld 指令将系统调用参数从栈中恢复到寄存器 a0 至 a5 中。我们分析发现系统调用的参数需通过参数寄存器传递给内核。在参数准备完成后，程序执行 ecall 指令。ecall 并不是一次普通的函数调用指令，其语义是主动触发一次环境调用异常。当 CPU 在用户态执行该指令时，会立即产生异常并中断当前用户态指令流，由异常处理机制接管控制权，从而实现从用户态向内核态的切换。
-
-在内核完成系统调用处理并通过 sret 返回用户态之后，系统调用的返回值按照 ABI 约定存放在寄存器 a0 中，随后用户态代码通过 sd a0,28(sp) 指令将返回值保存回栈中，并作为 syscall 函数的返回值返回给上层用户程序。从用户程序的角度看，系统调用的使用形式类似于一次普通函数调用，但在底层实现中，其进入和返回过程完全由异常与特权级切换机制完成。
-
-
-
-### 四、QEMU 中 ecall 的 TCG 翻译流程（Host 侧）
-
-#### 背景知识：QEMU 的 TCG 动态二进制翻译机制
-
-QEMU 是一种基于软件的全系统模拟器，其核心任务是在 Host 架构（如 x86-64）上正确模拟 Guest 架构（如 RISC-V）处理器的行为。由于 Host CPU 无法直接执行 Guest 指令，QEMU 采用了 **TCG（Tiny Code Generator）** 作为其核心的动态二进制翻译引擎。
-
-TCG 的基本思想是：在程序运行过程中，将 Guest 指令动态翻译为一段等价的 Host 可执行代码，并在 Host 上执行该代码，从而在语义上模拟 Guest CPU 的执行效果。这一过程并非逐条指令即时翻译执行，而是以 **Translation Block（TB）** 为基本单位进行。
-
-**1. Translation Block（TB）的概念**
-
-Translation Block 是 QEMU 中指令翻译与缓存的基本单位，一个 TB 通常具有以下特征：
-
-- 从某个 Guest 程序计数器（PC）开始；
-- 包含一段顺序执行的 Guest 指令；
-- 在遇到控制流可能发生变化的指令时终止。
-
-控制流变化的典型情形包括：
-- 条件或无条件跳转；
-- 异常或中断；
-- 系统调用指令（如 RISC-V 的 `ecall`）。
-
-TB 一旦生成，其对应的 Host 代码会被缓存；当 Guest 再次执行到同一 PC 时，QEMU 可以直接复用该 TB，而无需重新翻译，从而显著提升执行效率。
-
-
-**2. TCG 翻译的总体流程**
-
-从整体上看，TCG 的执行流程可以概括为以下几个阶段：
-
-1. **TB 查找（tb_find）**  
-   QEMU 根据当前 Guest PC 查询是否已有对应的 TB。
-
-2. **TB 生成（tb_gen_code）**  
-   若未命中已有 TB，则创建新的 Translation Block，并启动翻译流程。
-
-3. **指令翻译（gen_intermediate_code / translator_loop）**  
-   QEMU 调用与 Guest 架构相关的翻译器，将 Guest 指令逐条翻译为 TCG 中间表示（TCG IR）。
-
-4. **TB 执行（cpu_tb_exec）**  
-   翻译完成后，TCG 将 IR 转换为 Host 可执行代码并执行，通过修改 QEMU 中维护的 Guest CPU 状态结构体来模拟指令语义。
-
-**3. TCG IR 与 Guest CPU 状态模拟**
-
-TCG IR 是 QEMU 内部定义的一种与具体硬件无关的中间表示，用于描述 Guest 指令的语义效果。  
-在执行阶段，TCG 生成的 Host 代码并不直接操作真实硬件寄存器，而是通过读写 QEMU 中的 Guest CPU 状态结构体（如 `CPUArchState`）来实现：
-
-- Guest 程序计数器（PC）的更新；
-- 通用寄存器与 CSR 的读写；
-- 特权级的切换。
-
-因此，从 Guest 的视角来看，指令的执行效果与真实硬件一致；而从 Host 的视角来看，只是在执行一段普通的本地代码。
-
-
-**4. 系统调用指令与 TB 边界的关系**
-
-系统调用指令（如 RISC-V 的 `ecall`）在语义上会触发同步异常，其执行结果包括但不限于：
-
-- 保存异常返回地址；
-- 设置异常原因寄存器；
-- 切换处理器特权级；
-- 跳转到异常处理入口。
-
-由于执行 `ecall` 后的下一条 PC 不再是顺序的 `pc + 指令长度`，而是由异常处理机制决定，因此该类指令天然构成 Translation Block 的终止边界。  
-在 QEMU 的 TCG 模型中，这类指令通常会被单独翻译为一个 TB，以确保异常语义与控制流切换的精确模拟。
-
-
-
-#### 4.1 设置 TCG 关键断点
-
-在 QEMU-gdb（窗口 C）中，对以下函数设置断点：
-
-* `translator_loop`
-* `gen_intermediate_code`
-* `tb_gen_code`
-* `cpu_tb_exec`
-
-当 guest 执行到 ecall（PC=0x800104）时，QEMU 若未命中已有 TB，会先通过 tb_gen_code 触发 TB 生成；随后 gen_intermediate_code 驱动翻译过程，并在 translator_loop 中调用 RISC-V 后端逐条将指令翻译为 TCG IR；生成完成后，TB 交由 cpu_tb_exec 执行，从而在 host 上模拟该条指令对 guest 状态（PC/CSR/特权级）的影响。
-
-
-#### 4.2 命中翻译流程并观察调用栈
-
-当 Guest 执行到 `ecall` 时，QEMU 依次命中以下断点：
-
-* `tb_gen_code`
-* `gen_intermediate_code`
-* `translator_loop`
-
-
-```markdown
-![QEMU 中 ecall 进入 tb_gen_code](images/02_tb_gen_code.png)
-```
-
-```markdown
-![gen_intermediate_code 调用栈](images/03_gen_intermediate_code.png)
-```
-
-```markdown
-![translator_loop](images/04_translator_loop.png)
-```
-
-这说明 `ecall` **确实进入了 TCG Translation 流程**，而非被 QEMU 特判绕过。
-
-
-#### 4.3 验证 ecall 被翻译为单指令 TB
-
-在 `cpu_tb_exec` 断点处，打印 TB 信息：
-
-```gdb
-p/x ((TranslationBlock*)itb)->pc
-p/x ((TranslationBlock*)itb)->size
-```
-
-得到结果：
-
-* `TB.pc   = 0x800104`
-* `TB.size = 0x4`
-* `TB.pc + size = 0x800108`
-
-
-```markdown
-![cpu_tb_exec 中查看 TB.pc 与 TB.size](images/04_cpu_tb_exec_tb.png)
-```
-
-说明：
-
-QEMU 将 `ecall` 单独翻译为一个仅包含该指令的 Translation Block，并在 `cpu_tb_exec` 中执行。
-
-
-### 五、ecall 执行后的 CSR 数值验证（关键证据）
-
-在 Guest 进入 `__alltraps` 后，立即检查 CSR：
-
-```gdb
-p/x $sepc
-p/x $scause
-p/x $sstatus
-```
-
-得到结果：
-
-* `sepc   = 0x800104`
-* `scause = 0x8`
-* `sstatus = 0x8000000000046020`
-
-
-```markdown
-![ecall 后的 CSR 数值](images/05_ecall_csr.png)
-```
-
-解释：
-
-* `scause = 0x8` 表示 **Environment call from U-mode**；
-* `sepc` 保存了与系统调用返回相关的地址；
-* `sstatus` 的变化表明 CPU 已从 U-mode 切换至 S-mode。
-
-
-### 六、sret 指令的执行与返回用户态
-
-#### 6.1 定位 sret 指令
-
-系统调用处理完成后，执行流进入：
-
-```asm
-__trapret:
-    RESTORE_ALL
-    sret
-```
-
-在 `sret` 处下断点。
-
-
-#### 6.2 单步执行 sret 并验证返回结果
-
-执行：
-
-```gdb
-si
-p/x $pc
-```
-
-得到：
-
-* `pc = 0x800108`
-
-
-```markdown
-![sret 执行后 pc 恢复](images/06_sret_pc.png)
-```
-
-随后程序重新回到用户态，并再次命中用户态 syscall 断点，说明：
-
-* `sret` 正确恢复 PC；
-* 特权级成功从 S-mode 返回 U-mode；
-* 用户程序继续执行。
-
-
-### 七、TCG Translation 的作用总结与对比
-
-通过本实验可以明确看到：
-
-* `ecall` / `sret` 与普通指令一样，均需经过 **TCG Translation**；
-* 指令被翻译为 TB，再由 `cpu_tb_exec` 执行；
-* 特权指令往往形成 **单指令 TB**，作为 TB 的边界。
-
-
-
-### 八、调试过程中的抓马细节与收获
-
-* 双重 GDB 容易出现“一个窗口停、另一个窗口卡住”的现象；
-* 汇编标签（如 `__trapret`）无法直接用函数名断点，需要使用文件 + 行号；
-* 在 QEMU 中查看 TB 时需要将 `itb` 强制转换为 `TranslationBlock*`。
-
-
-### 九、大模型在实验中的作用
-
-在实验过程中，大模型主要用于：
-
-* 分析 Lab5 中用户程序的加载方式；
-* 辅助定位 QEMU 中与 TCG 相关的关键函数；
-* 帮助解释双重 GDB 卡住、sret 后再次命中 syscall 等现象；
-* 将零散调试现象整理为完整、可解释的执行流程。
-
-
-
-### 总结
-
-总体来看，本次实验的重点在于 **“理解操作系统的基本运行骨架”**，包括进程的创建、执行、切换与退出，以及用户态与内核态之间的控制权转移。而操作系统原理课程中，还有大量内容关注：
-
-- 性能优化
-- 并发与可扩展性
-- 资源受限条件下的策略选择
-- 工程级系统设计问题
-
-这些内容在实验中并未直接体现，但通过实验建立的直观理解，为进一步学习和理解这些原理知识打下了基础。
-
----
 
 ## 重要知识点
 
@@ -2230,6 +1923,316 @@ ucore 实验默认运行在单核环境中：
 
 **理解与差异：**  
 实验适合教学和理解基本机制，而 OS 原理中的多核设计则是对这些机制的“扩展版与强化版”，复杂度显著提升。
+
+
+
+## 分支任务 2：基于双重 GDB 的 QEMU 中 ecall / sret 指令处理流程分析
+
+
+### 一、实验目的与任务要求
+
+在前序实验中，我们已经通过“双重 GDB”调试的方法，观察了 QEMU 对访存指令进行地址翻译（页表查询）的过程。本分支任务在此基础上，沿用相同的调试思路，进一步观察 **系统调用相关特权指令 `ecall` 与 `sret` 在 QEMU 中的处理流程**。
+
+本实验的主要目标包括：
+
+* 观察一次系统调用从 **用户态（U-mode）进入内核态（S-mode）再返回用户态** 的完整执行过程；
+* 在 QEMU 源码层面，验证 `ecall` / `sret` 是否经过 **TCG Translation（指令翻译）**，并以 **Translation Block（TB）** 的形式执行；
+* 结合调试结果与 QEMU 源码，解释 QEMU 在执行上述指令时的关键处理流程；
+* 记录调试过程中出现的问题、“抓马”的细节，以及大模型在实验中的辅助作用。
+
+
+### 二、实验环境与调试方法
+
+#### 2.1 实验环境
+
+* 架构：RISC-V 64
+* 操作系统：uCore（Lab5）
+* 模拟器：QEMU 4.1.1（debug 版本）
+* 调试工具：
+  * `riscv64-unknown-elf-gdb`（调试 uCore，Guest 侧）
+  * `gdb`（attach 到 QEMU 进程，Host 侧）
+
+
+#### 2.2 双重 GDB 调试结构
+
+实验采用三个终端窗口：
+
+* **窗口 A**：启动 QEMU（`make debug`）
+* **窗口 B**：使用 riscv64-gdb 调试 uCore
+* **窗口 C**：使用 gdb attach 到 QEMU 进程
+
+当窗口 C 命中断点时，QEMU 会暂停执行，从而导致窗口 B 中的程序卡住，进而我们就可以观察执行到不同函数时，QEMU和ucore的状态了。
+
+
+### 三、用户态 syscall 与 ecall 指令的执行观察（Guest 侧）
+
+#### 3.1 加载用户程序符号并定位 syscall
+
+最初尝试在 `user/libs/syscall.c` 中下断点失败。通过分析 Lab5 工程结构并借助大模型确认：
+
+* 用户程序并非运行时从文件系统加载；
+* 而是以 **Link-in-Kernel** 的方式静态链接进内核；
+* 因此需要手动加载用户程序 ELF 的符号表。
+
+在 ucore-gdb 中执行：
+
+```gdb
+add-symbol-file obj/__user_exit.out
+```
+其中的add-symbol-file obj/__user_exit.out 用来把用户程序 exit 的符号表/调试信息加载到 GDB 中，否则 GDB 只认识内核 bin/kernel，无法对 user/libs/syscall.c 按文件行号下断点或显示用户态函数名。
+```gdb
+b user/libs/syscall.c:19
+```
+然后我们成功在 syscall 函数处下断点。
+
+
+#### 3.2 单步执行至 ecall 指令
+
+我们在 syscall 函数内部单步执行（不断执行si指令），直到指针对准ecall指令，可观察到如下汇编代码：
+
+```asm
+ld a0,8(sp)
+ld a1,40(sp)
+ld a2,48(sp)
+ld a3,56(sp)
+ld a4,64(sp)
+ld a5,72(sp)
+ecall
+sd a0,28(sp)
+```
+
+```markdown
+![用户态 syscall 中的 ecall 指令](images/01_syscall_ecall.png)
+```
+
+我们观察汇编代码发现在执行 ecall 之前，程序依次通过多条 ld 指令将系统调用参数从栈中恢复到寄存器 a0 至 a5 中。我们分析发现系统调用的参数需通过参数寄存器传递给内核。在参数准备完成后，程序执行 ecall 指令。ecall 并不是一次普通的函数调用指令，其语义是主动触发一次环境调用异常。当 CPU 在用户态执行该指令时，会立即产生异常并中断当前用户态指令流，由异常处理机制接管控制权，从而实现从用户态向内核态的切换。
+
+在内核完成系统调用处理并通过 sret 返回用户态之后，系统调用的返回值按照 ABI 约定存放在寄存器 a0 中，随后用户态代码通过 sd a0,28(sp) 指令将返回值保存回栈中，并作为 syscall 函数的返回值返回给上层用户程序。从用户程序的角度看，系统调用的使用形式类似于一次普通函数调用，但在底层实现中，其进入和返回过程完全由异常与特权级切换机制完成。
+
+
+
+### 四、QEMU 中 ecall 的 TCG 翻译流程（Host 侧）
+
+#### 背景知识：QEMU 的 TCG 动态二进制翻译机制
+
+QEMU 是一种基于软件的全系统模拟器，其核心任务是在 Host 架构（如 x86-64）上正确模拟 Guest 架构（如 RISC-V）处理器的行为。由于 Host CPU 无法直接执行 Guest 指令，QEMU 采用了 **TCG（Tiny Code Generator）** 作为其核心的动态二进制翻译引擎。
+
+TCG 的基本思想是：在程序运行过程中，将 Guest 指令动态翻译为一段等价的 Host 可执行代码，并在 Host 上执行该代码，从而在语义上模拟 Guest CPU 的执行效果。这一过程并非逐条指令即时翻译执行，而是以 **Translation Block（TB）** 为基本单位进行。
+
+**1. Translation Block（TB）的概念**
+
+Translation Block 是 QEMU 中指令翻译与缓存的基本单位，一个 TB 通常具有以下特征：
+
+- 从某个 Guest 程序计数器（PC）开始；
+- 包含一段顺序执行的 Guest 指令；
+- 在遇到控制流可能发生变化的指令时终止。
+
+控制流变化的典型情形包括：
+- 条件或无条件跳转；
+- 异常或中断；
+- 系统调用指令（如 RISC-V 的 `ecall`）。
+
+TB 一旦生成，其对应的 Host 代码会被缓存；当 Guest 再次执行到同一 PC 时，QEMU 可以直接复用该 TB，而无需重新翻译，从而显著提升执行效率。
+
+
+**2. TCG 翻译的总体流程**
+
+从整体上看，TCG 的执行流程可以概括为以下几个阶段：
+
+1. **TB 查找（tb_find）**  
+   QEMU 根据当前 Guest PC 查询是否已有对应的 TB。
+
+2. **TB 生成（tb_gen_code）**  
+   若未命中已有 TB，则创建新的 Translation Block，并启动翻译流程。
+
+3. **指令翻译（gen_intermediate_code / translator_loop）**  
+   QEMU 调用与 Guest 架构相关的翻译器，将 Guest 指令逐条翻译为 TCG 中间表示（TCG IR）。
+
+4. **TB 执行（cpu_tb_exec）**  
+   翻译完成后，TCG 将 IR 转换为 Host 可执行代码并执行，通过修改 QEMU 中维护的 Guest CPU 状态结构体来模拟指令语义。
+
+**3. TCG IR 与 Guest CPU 状态模拟**
+
+TCG IR 是 QEMU 内部定义的一种与具体硬件无关的中间表示，用于描述 Guest 指令的语义效果。  
+在执行阶段，TCG 生成的 Host 代码并不直接操作真实硬件寄存器，而是通过读写 QEMU 中的 Guest CPU 状态结构体（如 `CPUArchState`）来实现：
+
+- Guest 程序计数器（PC）的更新；
+- 通用寄存器与 CSR 的读写；
+- 特权级的切换。
+
+因此，从 Guest 的视角来看，指令的执行效果与真实硬件一致；而从 Host 的视角来看，只是在执行一段普通的本地代码。
+
+
+**4. 系统调用指令与 TB 边界的关系**
+
+系统调用指令（如 RISC-V 的 `ecall`）在语义上会触发同步异常，其执行结果包括但不限于：
+
+- 保存异常返回地址；
+- 设置异常原因寄存器；
+- 切换处理器特权级；
+- 跳转到异常处理入口。
+
+由于执行 `ecall` 后的下一条 PC 不再是顺序的 `pc + 指令长度`，而是由异常处理机制决定，因此该类指令天然构成 Translation Block 的终止边界。  
+在 QEMU 的 TCG 模型中，这类指令通常会被单独翻译为一个 TB，以确保异常语义与控制流切换的精确模拟。
+
+
+
+#### 4.1 设置 TCG 关键断点
+
+在 QEMU-gdb（窗口 C）中，对以下函数设置断点：
+
+* `translator_loop`
+* `gen_intermediate_code`
+* `tb_gen_code`
+* `cpu_tb_exec`
+
+当 guest 执行到 ecall（PC=0x800104）时，QEMU 若未命中已有 TB，会先通过 tb_gen_code 触发 TB 生成；随后 gen_intermediate_code 驱动翻译过程，并在 translator_loop 中调用 RISC-V 后端逐条将指令翻译为 TCG IR；生成完成后，TB 交由 cpu_tb_exec 执行，从而在 host 上模拟该条指令对 guest 状态（PC/CSR/特权级）的影响。
+
+
+#### 4.2 命中翻译流程并观察调用栈
+
+当 Guest 执行到 `ecall` 时，QEMU 依次命中以下断点：
+
+* `tb_gen_code`
+* `gen_intermediate_code`
+* `translator_loop`
+
+
+```markdown
+![QEMU 中 ecall 进入 tb_gen_code](images/02_tb_gen_code.png)
+```
+
+```markdown
+![gen_intermediate_code 调用栈](images/03_gen_intermediate_code.png)
+```
+
+```markdown
+![translator_loop](images/04_translator_loop.png)
+```
+
+这说明 `ecall` **确实进入了 TCG Translation 流程**，而非被 QEMU 特判绕过。
+
+
+#### 4.3 验证 ecall 被翻译为单指令 TB
+
+在 `cpu_tb_exec` 断点处，打印 TB 信息：
+
+```gdb
+p/x ((TranslationBlock*)itb)->pc
+p/x ((TranslationBlock*)itb)->size
+```
+
+得到结果：
+
+* `TB.pc   = 0x800104`
+* `TB.size = 0x4`
+* `TB.pc + size = 0x800108`
+
+
+```markdown
+![cpu_tb_exec 中查看 TB.pc 与 TB.size](images/04_cpu_tb_exec_tb.png)
+```
+
+说明：
+
+QEMU 将 `ecall` 单独翻译为一个仅包含该指令的 Translation Block，并在 `cpu_tb_exec` 中执行。
+
+
+### 五、ecall 执行后的 CSR 数值验证（关键证据）
+
+在 Guest 进入 `__alltraps` 后，立即检查 CSR：
+
+```gdb
+p/x $sepc
+p/x $scause
+p/x $sstatus
+```
+
+得到结果：
+
+* `sepc   = 0x800104`
+* `scause = 0x8`
+* `sstatus = 0x8000000000046020`
+
+
+```markdown
+![ecall 后的 CSR 数值](images/05_ecall_csr.png)
+```
+
+解释：
+
+* `scause = 0x8` 表示 **Environment call from U-mode**；
+* `sepc` 保存了与系统调用返回相关的地址；
+* `sstatus` 的变化表明 CPU 已从 U-mode 切换至 S-mode。
+
+
+### 六、sret 指令的执行与返回用户态
+
+#### 6.1 定位 sret 指令
+
+系统调用处理完成后，执行流进入：
+
+```asm
+__trapret:
+    RESTORE_ALL
+    sret
+```
+
+在 `sret` 处下断点。
+
+
+#### 6.2 单步执行 sret 并验证返回结果
+
+执行：
+
+```gdb
+si
+p/x $pc
+```
+
+得到：
+
+* `pc = 0x800108`
+
+
+```markdown
+![sret 执行后 pc 恢复](images/06_sret_pc.png)
+```
+
+随后程序重新回到用户态，并再次命中用户态 syscall 断点，说明：
+
+* `sret` 正确恢复 PC；
+* 特权级成功从 S-mode 返回 U-mode；
+* 用户程序继续执行。
+
+
+### 七、TCG Translation 的作用总结与对比
+
+通过本实验可以明确看到：
+
+* `ecall` / `sret` 与普通指令一样，均需经过 **TCG Translation**；
+* 指令被翻译为 TB，再由 `cpu_tb_exec` 执行；
+* 特权指令往往形成 **单指令 TB**，作为 TB 的边界。
+
+
+
+### 八、调试过程中的抓马细节与收获
+
+* 双重 GDB 容易出现“一个窗口停、另一个窗口卡住”的现象；
+* 汇编标签（如 `__trapret`）无法直接用函数名断点，需要使用文件 + 行号；
+* 在 QEMU 中查看 TB 时需要将 `itb` 强制转换为 `TranslationBlock*`。
+
+
+### 九、大模型在实验中的作用
+
+在实验过程中，大模型主要用于：
+
+* 分析 Lab5 中用户程序的加载方式；
+* 辅助定位 QEMU 中与 TCG 相关的关键函数；
+* 帮助解释双重 GDB 卡住、sret 后再次命中 syscall 等现象；
+* 将零散调试现象整理为完整、可解释的执行流程。
+
+
 
 ### 总结
 
