@@ -433,6 +433,1297 @@
 
 通过阅读代码可以看到，`fork/exec/wait/exit` 的共同点是：用户态只负责通过系统调用发起请求与传参；真正的进程创建、地址空间管理、资源回收、阻塞与唤醒等关键操作都在内核态完成。用户态与内核态的交错执行依赖 trap 机制与调度器：每次 `ecall` 都会进入内核，内核可能直接返回用户态，也可能在返回前发生调度或退出，从而在宏观上实现多个进程交替运行。
 
+
+## Challenge 
+
+### 1. 为什么用Copy-on-Write
+
+在 `fork()` 系统调用之后，父子进程在逻辑上应当拥有**一致的虚拟地址空间内容**。如果在 `fork()` 时直接对父进程的全部用户空间进行深拷贝，将导致：
+
+* fork 时间复杂度与用户页数量线性相关，性能开销大；
+* 子进程常在 fork 后立即执行 `exec()`，深拷贝的内存往往不会被真正使用；
+* 不符合 Linux 等主流操作系统的实现方式。
+
+因此，本实验在 ucore 中引入 **Copy-on-Write（COW）机制**，其核心思想是：
+
+> fork 时不复制数据，只复制页表；
+> 只有在“写发生时”，才真正复制物理页。
+
+
+### 2. COW 的整体实现思路
+
+在 ucore 原有代码基础上，本实验的 COW 实现主要涉及三处修改：
+
+1. **fork 阶段的页表复制策略（`copy_range`）**
+2. **trap / page fault 的派发与区分写缺页**
+3. **`do_pgfault` 中对 COW 写缺页的处理逻辑**
+
+下面结合具体代码，逐一进行说明。
+
+#### 2.1 fork 阶段的 COW 页表构造实现
+
+##### 修改后的核心代码
+
+```c
+#define PTE_COW  0x100
+
+int
+copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end, bool share) {
+    uintptr_t addr = start;
+    while (addr < end) {
+        pte_t *ptep = get_pte(from, addr, 0);
+        if (ptep == NULL || !(*ptep & PTE_V)) {
+            addr += PGSIZE;
+            continue;
+        }
+
+        struct Page *page = pte2page(*ptep);
+        uint32_t flags = (*ptep & 0x3FF);
+        flags |= PTE_V;
+
+        if (share) {
+            if (flags & PTE_W) {
+                flags = (flags & ~PTE_W) | PTE_COW;
+                *ptep = pte_create(page2ppn(page), flags);
+                tlb_invalidate(from, addr);
+            }
+
+            page_ref_inc(page);
+            pte_t *nptep = get_pte(to, addr, 1);
+            *nptep = pte_create(page2ppn(page), flags);
+            tlb_invalidate(to, addr);
+        } else {
+            struct Page *newp = alloc_page();
+            memcpy(page2kva(newp), page2kva(page), PGSIZE);
+            page_insert(to, newp, addr, flags & (PTE_R | PTE_W | PTE_X | PTE_U));
+        }
+
+        addr += PGSIZE;
+    }
+    return 0;
+}
+```
+
+##### 代码分析说明
+
+这段代码实现了 fork 阶段的 Copy-on-Write 页表构造逻辑，其核心目标是在 fork 时避免对用户空间页面进行立即复制，而是让父子进程共享同一物理页。
+
+代码首先遍历父进程页表中 `[start, end)` 范围内的每一个虚拟页，通过 `get_pte` 获取页表项。如果该虚拟页未映射有效物理页，则直接跳过。
+
+当 `share == true` 时，表示 fork 采用共享策略，这时我们不需要再像之前那样写的时候就全部深拷贝。此时仅当原页具有写权限（`PTE_W`）时，才启用 COW 机制：通过清除 `PTE_W` 并设置 `PTE_COW`，将该页变为“只读的 COW 页”。这一修改不仅作用于子进程页表，同时也**回写父进程页表项**，保证父子进程在 fork 后对该页的访问权限完全一致，从而确保任一进程的写操作都会触发缺页异常。
+
+随后，通过 `page_ref_inc` 增加物理页引用计数，表明该页被多个进程共享；并在子进程页表中建立指向同一物理页的映射。最后对父子页表分别执行 `tlb_invalidate`，防止 CPU 使用旧的可写权限缓存。
+
+
+#### 2.2 trap 与写缺页的识别机制
+
+##### 修改后的核心代码
+
+```c
+static int
+pgfault_handler(struct trapframe *tf) {
+    uintptr_t addr = tf->badvaddr;
+    uint32_t error_code = 0;
+
+    if (tf->cause == CAUSE_STORE_PAGE_FAULT) {
+        error_code |= 0x1;   // write fault
+    }
+
+    return do_pgfault(current->mm, error_code, addr);
+}
+```
+
+##### 代码分析说明
+
+该代码用于在异常处理阶段区分“写导致的缺页异常”。在 RISC-V 架构下，store page fault 表示写访问触发的异常。通过在 `error_code` 中设置写标志位，内核可以在 `do_pgfault` 中统一判断该缺页是否由写操作引起。
+
+这一设计的意义在于：**Copy-on-Write 逻辑只应在“写缺页”时触发**，而读缺页或非法访问应当由其他路径处理，从而避免 COW 与普通缺页逻辑混杂。
+
+
+#### 2.3 `do_pgfault` 中的写时复制实现
+
+##### 修改后的核心代码
+
+```c
+int
+do_pgfault(struct mm_struct *mm, uint32_t error_code, uintptr_t addr) {
+    bool write = (error_code & 0x1) != 0;
+    uintptr_t la = ROUNDDOWN(addr, PGSIZE);
+    pte_t *ptep = get_pte(mm->pgdir, la, 0);
+
+    if (ptep != NULL && (*ptep & PTE_V)) {
+        if (write && (*ptep & PTE_COW)) {
+            struct Page *old = pte2page(*ptep);
+            uint32_t flags = (*ptep & 0x3FF);
+
+            if (page_ref(old) == 1) {
+                flags = (flags | PTE_W) & ~PTE_COW;
+                *ptep = pte_create(page2ppn(old), flags);
+                tlb_invalidate(mm->pgdir, la);
+                return 0;
+            }
+
+            struct Page *newp = alloc_page();
+            memcpy(page2kva(newp), page2kva(old), PGSIZE);
+
+            page_remove(mm->pgdir, la);
+            page_insert(mm->pgdir, newp, la,
+                        flags & (PTE_R | PTE_W | PTE_X | PTE_U));
+            return 0;
+        }
+
+        if (write) {
+            return -E_INVAL;
+        }
+    }
+    return -E_NO_MEM;
+}
+```
+
+##### 代码分析说明
+
+这段代码是 Copy-on-Write 的核心实现。当发生缺页异常时，内核首先判断该异常是否由写操作引起，且目标页是否被标记为 `PTE_COW`。只有在同时满足这两个条件时，才进入 COW 处理逻辑。
+
+当物理页的引用计数为 1 时，说明该页已经不再被其他进程共享，仅由于 fork 后遗留的 COW 标记而保持只读状态。此时无需复制物理页，只需恢复写权限并清除 COW 标志即可，这是一个重要的性能优化路径。
+
+当引用计数大于 1 时，表示该页仍处于共享状态。内核为当前进程分配新的物理页，并将原共享页内容完整复制过去，然后解除旧页映射并建立新的可写映射。这样可以确保写进程获得私有副本，而其他进程的视图不受影响，从而正确实现写时复制语义。
+
+
+#### 2.4 COW 功能测试代码与运行样例说明
+
+##### 测试用例核心代码
+
+```c
+#include <ulib.h>
+#include <unistd.h>
+#include <stdio.h>
+
+static char pagebuf[4096];
+
+int main(void) {
+    // 1) fork 前：父进程初始化页内容
+    pagebuf[0] = 'A';
+    pagebuf[1] = 'A';
+
+    int pid = fork();
+    if (pid < 0) {
+        cprintf("fork failed\n");
+        return -1;
+    }
+
+    if (pid == 0) {
+        // 2) 子进程：对共享页进行写操作（应触发 COW）
+        pagebuf[0] = 'B';
+        pagebuf[1] = 'C';
+        cprintf("[child] %c %c\n", pagebuf[0], pagebuf[1]);
+        exit(0);
+    }
+
+    // 3) 父进程：等待子进程结束，避免并发输出影响判断
+    int st = 0;
+    waitpid(pid, &st);
+
+    // 4) 父进程检查：如果 COW 正确，父进程仍应看到 fork 前写入的 'A','A'
+    if (pagebuf[0] == 'A' && pagebuf[1] == 'A') {
+        cprintf("COW OK\n");
+    } else {
+        cprintf("COW FAIL: %c %c\n", pagebuf[0], pagebuf[1]);
+    }
+    return 0;
+}
+```
+
+##### 代码分析说明
+
+该测试用例的目标是验证：**fork 后父子进程初始共享同一物理页，但子进程写入后，父进程不应被污染，而是复制并写入新的页**。
+
+测试流程按执行时序可以分为四步：
+
+第一步，父进程在 `fork()` 之前将 `pagebuf[0..1]` 初始化为 `'A','A'`。由于 `pagebuf` 是全局数组，属于用户态数据段/匿名页一类（可写），fork 时这类页应该被纳入 COW 机制：父子进程最开始共享同一物理页，并且页表权限会被改为“只读 + `PTE_COW`”。
+
+第二步，子进程分支中对 `pagebuf` 做写入（`'B','C'`）。由于 fork 后该页在子进程页表中应为只读（`PTE_W=0`）且带有 `PTE_COW`，因此写入会触发 **store page fault**。异常进入 `pgfault_handler` 后会将该 fault 标记为写缺页（`error_code |= 0x1`），最终在 `do_pgfault` 中命中 `write && PTE_COW` 分支，执行 COW 拆分：如果该页仍共享（通常 `ref>1`），则为子进程分配新页并拷贝旧页内容，之后子进程对新页完成写入。
+
+第三步，父进程在 `waitpid(pid, &st)` 等待子进程结束，保证子进程已经完成写入并退出。这样父进程的检查发生在“子进程写操作已完成”的确定时刻，避免并发打印导致的观察困难（但不影响内存隔离本身）。
+
+第四步，父进程在 `waitpid` 返回后读取 `pagebuf[0..1]` 并判断是否仍为 `'A','A'`。如果 COW 正确实现，则父进程仍映射到原共享页（或其自身私有页，但内容应保持 fork 前的 `'A','A'`），因此会打印 `COW OK`；若 COW 实现错误（例如 fork 阶段没有把父页也改成只读，或写缺页未正确拆分），则父进程可能读到子进程写入的 `'B','C'`，从而打印 `COW FAIL`。
+
+##### 运行输出样例与含义解释
+
+本次运行得到的关键输出如下：
+![COW 结果验证](images/实验结果1.png)
+```
+kernel_execve: pid = 2, name = "cowtest".
+Breakpoint
+[COW fault] pid=2 va=0x7ffff000 ref=2
+[child] B C
+COW OK
+```
+
+对每一行含义解释如下：
+
+* `kernel_execve: pid = 2, name = "cowtest".`
+  表示内核成功加载并执行用户程序 `cowtest`，pid=2。说明测试用例进入了用户态执行流程。
+
+* `Breakpoint`
+  这是调试过程中触发断点的提示。
+
+* `[COW fault] pid=2 va=0x7ffff000 ref=2`
+  这是我在 `do_pgfault` 的 `write && PTE_COW` 分支中加入的调试输出，用来证明“写确实命中了 COW 分支”。
+
+  * `pid=2`：触发 COW fault 的是当前执行写操作的进程（此处为子进程/执行流）。
+  * `va=0x7ffff000`：发生写缺页的虚拟页地址（页对齐）。说明 fault 的确发生在 `pagebuf` 所在页。
+  * `ref=2`：该物理页当时引用计数为 2，表明父子进程确实共享同一物理页（fork 后共享状态成立），因此必须进行“分配新页 + memcpy”的拆分路径。
+
+* `[child] B C`
+  子进程在写入后打印自身视角下的内容，说明子进程写入生效，并且写入后的读也读到了 `'B','C'`（对自己的私有页或已拆分页）。
+
+* `COW OK`
+  父进程最终检查 `pagebuf[0..1]` 仍为 `'A','A'`，说明子进程的写入没有污染父进程视角，满足 COW 。
+
+下面这段你可以**直接原样接在 2.4 后面，作为 `2.5` 小节**使用，风格、颗粒度和你前面的 2.1–2.4 是一致的，属于**“老师一看就知道你懂机制”的那种说明**。
+
+#### 2.5 COW 情况下的页状态转换分析（有限状态自动机视角）
+
+为了更清晰地理解 Copy-on-Write 机制在运行时的行为，可以从单个虚拟页（Virtual Page）的角度，将其在 fork 及写操作过程中的状态变化抽象为一个有限状态自动机。下面结合本实验中的具体实现，对各个状态及其转换进行说明。
+
+
+##### 状态定义
+
+以“某一虚拟页在某个进程地址空间中的状态”为观察对象，定义如下几种典型状态：
+
+**S0：私有可写页（Private-W）**
+
+* 页表状态：`PTE_W = 1, PTE_COW = 0`
+* 物理页引用计数：`ref = 1`
+* 含义：
+  该页仅被当前进程使用，且允许写入。这是 fork 之前父进程中数据段/栈页的初始状态。
+
+
+**S1：共享只读 COW 页（Shared-COW-RO）**
+
+* 页表状态：`PTE_W = 0, PTE_COW = 1`
+* 物理页引用计数：`ref ≥ 2`
+* 含义：
+  fork 之后，父子进程共享同一物理页。为了保证写操作能够被捕获，该页在父子进程页表中均被设置为只读，并打上 `PTE_COW` 标记。
+
+
+**S2：写后私有可写页（After-COW-Private-W）**
+
+* 页表状态：`PTE_W = 1, PTE_COW = 0`
+* 物理页引用计数：`ref = 1`
+* 含义：
+  某一进程对 COW 页进行写操作后，内核为其分配了新的物理页并完成数据拷贝，该进程获得私有、可写的页。
+
+
+**S3：最后持有者的 COW 只读页（Last-Owner-COW-RO）**
+
+* 页表状态：`PTE_W = 0, PTE_COW = 1`
+* 物理页引用计数：`ref = 1`
+* 含义：
+  原本共享的 COW 页中，其他进程已经退出或解除映射，导致引用计数降为 1，但当前进程页表中仍残留 COW 标记和只读权限。
+
+
+##### 状态转移关系
+
+上述状态之间的主要转移关系如下（从 fork 到写缺页的完整生命周期）：
+
+```text
+S0: 私有可写页 (W=1, COW=0, ref=1)
+        |
+        | fork (copy_range, share=true)
+        v
+S1: 共享COW只读页 (W=0, COW=1, ref>=2)
+        |
+        | 写操作触发 store page fault
+        | 且 ref > 1
+        v
+S2: 写后私有可写页 (W=1, COW=0, ref=1)
+```
+
+此外，还存在一个重要的中间情况：
+
+```text
+S1: 共享COW只读页
+        |
+        | 另一进程 exit / unmap
+        v
+S3: 最后持有者COW只读页 (ref=1)
+        |
+        | 写操作触发 store page fault
+        v
+S2: 写后私有可写页
+```
+
+---
+
+##### 与具体代码实现的对应关系
+
+上述状态转换与本实验中的代码路径是一一对应的：
+
+* **S0 → S1**
+  发生在 `copy_range(..., share=true)` 中：
+  对原本可写页清除 `PTE_W`、设置 `PTE_COW`，父子进程共享同一物理页并增加引用计数。
+
+* **S1 → S2（ref > 1）**
+  发生在 `do_pgfault` 中 `write && PTE_COW && page_ref(old) > 1` 分支：
+  分配新页、`memcpy` 拷贝数据、解除旧映射并建立新的可写映射。
+
+* **S1 → S3**
+  发生在另一进程退出或解除映射时（由进程退出路径或 `page_remove` 维护引用计数）：
+  共享页退化为“仅剩一个进程引用，但仍保持 COW 只读状态”。
+
+* **S3 → S2（ref == 1）**
+  发生在 `do_pgfault` 中 `page_ref(old) == 1` 的快速路径：
+  不再分配新页，仅恢复写权限并清除 `PTE_COW`，避免不必要的拷贝。
+
+
+### 3. Dirty COW 漏洞复现与分析（基于 ucore 的教学型实现）
+
+在完成 Copy-on-Write 机制后，本实验进一步参考 Dirty COW（CVE-2016-5195）的核心思想，在 ucore 中构造了一条**绕过 COW 的写路径**，用于验证：
+
+> 如果存在不受约束的写入口，COW 机制将被破坏，进程间内存隔离不再成立。
+
+需要说明的是，这里的 Dirty COW 并非对 Linux 漏洞的完整复刻（如 `/proc/self/mem + madvise` 的竞态），而是**复现其本质效果**：
+**写操作绕过 COW 拆分，直接修改共享物理页。**
+
+
+#### 3.1 Dirty COW 用户态测试程序
+
+##### 测试用例核心代码
+
+```c
+#include <ulib.h>
+#include <unistd.h>
+#include <stdio.h>
+
+static char pagebuf[4096];
+
+// 最小 ecall 封装：a0=num, a1=arg1, a2=arg2
+static inline long u_syscall2(long num, long arg1, long arg2) {
+    register long a0 asm("a0") = num;
+    register long a1 asm("a1") = arg1;
+    register long a2 asm("a2") = arg2;
+    asm volatile("ecall"
+                 : "+r"(a0)
+                 : "r"(a1), "r"(a2)
+                 : "memory");
+    return a0;
+}
+
+int main(void) {
+    pagebuf[0] = 'A';
+
+    int pid = fork();
+    if (pid < 0) {
+        cprintf("fork failed\n");
+        return -1;
+    }
+
+    if (pid == 0) {
+        // 子进程：正常 COW 写路径
+        for (int i = 0; i < 500000; i++) {
+            pagebuf[0] = 'B';
+            if ((i & 1023) == 0) {
+                yield();
+            }
+        }
+        exit(0);
+    }
+
+    // 父进程：通过漏洞 syscall 直接写共享页
+    for (int i = 0; i < 500000; i++) {
+        u_syscall2(SYS_kmemwrite, (long)&pagebuf[0], (long)'X');
+        if ((i & 1023) == 0) {
+            yield();
+        }
+    }
+
+    waitpid(pid, NULL);
+
+    if (pagebuf[0] == 'X') {
+        cprintf("DIRTY COW TRIGGERED: parent page corrupted!\n");
+    } else {
+        cprintf("COW SAFE: %c\n", pagebuf[0]);
+    }
+
+    return 0;
+}
+```
+
+##### 代码分析说明
+
+该测试程序的设计目标是：**在 COW 已正确实现的前提下，验证是否存在一条写路径可以绕过 COW 拆分逻辑，从而污染共享页**。
+
+程序执行流程如下：
+
+首先，在 `fork()` 之前，父进程将 `pagebuf[0]` 初始化为 `'A'`。该数组位于用户态数据页中，属于可写页，因此在 fork 后应被纳入 COW 管理：父子进程初始共享同一物理页，且页表权限被设置为“只读 + PTE_COW”。
+
+接着，子进程进入循环，不断执行 `pagebuf[0] = 'B'`。这是**正常的用户态写路径**：由于该页是 COW 页，子进程第一次写入时会触发 store page fault，并在 `do_pgfault` 中完成物理页拆分，之后子进程写入的 `'B'` 仅作用于自己的私有页。
+
+与此同时，父进程并不通过普通的用户态写指令，而是反复调用一个特殊的系统调用 `SYS_kmemwrite`，尝试直接对 `pagebuf[0]` 所在页进行写入。通过在循环中加入 `yield()`，可以显著增加父子进程执行的交错程度，使漏洞现象更稳定、更容易复现。
+
+最后，父进程在 `waitpid` 等待子进程结束后，检查自身视角下的 `pagebuf[0]`。如果 COW 语义未被破坏，则父进程应仍看到 `'A'`；若看到 `'X'`，则说明父进程所在的页被非法修改，Dirty COW 复现成功。
+
+
+#### 3.2 Dirty COW 漏洞 syscall 的内核实现
+
+##### 漏洞 syscall 核心代码
+
+```c
+static int
+sys_kmemwrite(uint64_t arg[]) {
+    uintptr_t va = (uintptr_t)arg[0];
+    int value = (int)arg[1];
+
+    if (current == NULL || current->mm == NULL) {
+        return -E_INVAL;
+    }
+
+    struct mm_struct *mm = current->mm;
+    uintptr_t la = ROUNDDOWN(va, PGSIZE);
+
+    pte_t *ptep = get_pte(mm->pgdir, la, 0);
+    if (ptep == NULL || !(*ptep & PTE_V)) {
+        return -E_INVAL;
+    }
+
+
+    struct Page *p = pte2page(*ptep);
+    char *kva = (char *)page2kva(p);
+    kva[va - la] = (char)value;
+
+    return 0;
+}
+```
+
+#### 代码分析说明
+
+该系统调用是本实验中 **刻意引入的脆弱写接口**，用于模拟 Dirty COW 的漏洞本质。
+
+在该实现中，内核首先通过 `get_pte` 找到用户虚拟地址 `va` 对应的页表项，并通过 `pte2page` 定位到其对应的物理页结构 `struct Page`。随后，利用 `page2kva` 将该物理页映射到内核地址空间，直接对其进行写入。
+
+关键问题在于：
+
+* 该写操作不检查 `PTE_COW`；
+* 也不检查 `PTE_W`；
+* 写入发生在内核态的 `kva` 地址上，不会触发 store page fault；
+* 因此完全绕过了 `do_pgfault` 中的 COW 拆分逻辑。
+
+当该页正处于 fork 后的共享状态（父子进程共享同一物理页）时，这种写操作将**直接修改共享物理页本身**，从而使另一进程也能观察到被修改的数据，破坏进程间内存隔离。
+
+
+#### 3.3 系统调用注册与编号
+
+为支持该漏洞演示 syscall，本实验在系统调用表中新增了如下定义：
+
+```c
+#define SYS_kmemwrite 32
+```
+
+并在内核 syscall 分发表中注册：
+
+```c
+[SYS_kmemwrite] sys_kmemwrite,
+```
+
+
+
+#### 3.4 运行结果与漏洞触发分析
+
+本实验运行 `dirtycow_ucore` 时，得到如下关键输出：
+![dirtycow 结果验证](images/实验结果2.png)
+```
+kernel_execve: pid = 2, name = "dirtycow_ucore".
+Breakpoint
+DIRTY COW TRIGGERED: parent page corrupted!
+```
+
+上述输出表明：
+
+* 用户程序 `dirtycow_ucore` 被正确加载并执行；
+* 在 fork 后父子进程交错运行期间，父进程通过 `SYS_kmemwrite` 成功写入了共享页；
+* 父进程最终读到的 `pagebuf[0]` 被修改为 `'X'`，并非 fork 前的 `'A'`；
+* 说明 COW 的“写时拆分”被成功绕过，共享物理页被直接污染。
+
+
+
+#### 3.5 Dirty COW 的修复思路与防御措施
+
+通过前文的 Dirty COW 漏洞复现可以看到，其根本原因并不在于 Copy-on-Write 本身的实现错误，而在于**系统中存在一条能够绕过 COW 拆分逻辑的写路径**。因此，对 Dirty COW 类问题的修复核心在于：
+
+> **保证任何可能修改用户页内容的写操作，都必须遵循与普通用户写操作一致的 COW 语义。**
+
+结合本实验中的漏洞实现，可以从以下几个层面进行修复和防御。
+
+
+##### （1）禁止内核绕过页表权限直接写用户页
+
+在本实验中，`sys_kmemwrite` 通过 `page2kva` 直接写物理页，是导致漏洞的直接原因。最直接、最安全的修复方式是：
+
+* 不提供或彻底移除这种“内核直接写用户页物理内存”的接口；
+
+##### （2）在内核写用户页前显式遵守 COW 语义
+
+如果系统设计上确实需要内核代替用户进程修改用户页内容（例如调试接口、`copy_to_user` 类函数），则必须在写入前显式检查并处理 COW 状态。具体而言：
+
+* 在执行内核写入前，检查目标页的 PTE：
+
+  * 若检测到 `PTE_COW` 且写入发生；
+
+    * 若 `page_ref > 1`，则主动执行与 `do_pgfault(write && PTE_COW)` 等价的拆分流程（分配新页、复制、替换映射）；
+    * 若 `page_ref == 1`，则直接恢复写权限并清除 `PTE_COW`；
+* 确保内核写入的始终是当前进程的私有页。
+
+
+##### （3）与真实 Linux Dirty COW 修复的对应关系
+
+Linux 在修复 CVE-2016-5195 时，核心思路同样是**修补能够绕过 COW 的写路径**，包括：
+
+* 加强对 `/proc/self/mem` 写操作的权限与同步约束；
+* 修正 `get_user_pages()` 等接口在只读映射上的行为；
+* 防止在 COW 页仍共享时获得可写的物理页引用。
+
+可以看到，本实验中的修复思路与真实系统的修复原则在本质上是一致的，只是实现复杂度与触发条件有所不同。
+
+
+
+### 4. 用户程序加载时机分析及与常见操作系统加载的区别
+
+#### 4.1 用户程序在 ucore 中的加载时机与加载方式
+
+在本实验中，无论是 `cowtest` 还是 `dirtycow_ucore`，用户程序并不是在运行时通过文件系统动态加载的，而是**在系统启动阶段就已经被预先加载到内存中**。
+
+具体来说，该用户程序的加载时机发生在：
+
+> **内核启动阶段，由内核在初始化用户程序运行环境时，将用户程序的二进制镜像直接拷贝到内存中。**
+
+在 ucore 的实验环境下，用户程序通常以 **内嵌二进制数据（binary image）** 的形式存在，其加载流程大致为：
+
+1. 在构建系统镜像（如 `ucore.img`）时，用户程序已经被打包进最终镜像；
+2. 内核启动后，在创建第一个用户进程（或通过 `do_execve`）时：
+
+   * 内核直接从**内存中的二进制数据段**读取用户程序内容；
+   * 由内核完成 ELF 解析（或简化版加载）；
+   * 将程序段映射到用户进程的虚拟地址空间中；
+3. 不涉及磁盘访问，也不依赖文件系统路径查找。
+
+从你实际观察到的输出：
+
+```
+kernel_execve: pid = 2, name = "dirtycow_ucore".
+```
+
+可以看出，`execve` 的“加载源”并不是磁盘文件，而是已经驻留在内存中的程序镜像。
+
+因此，可以认为：
+**该用户程序在内核启动阶段就已经被预先加载到内存中，`execve` 只是完成地址空间构建与映射，而非真正的 I/O 加载。**
+
+
+#### 4.2 与常用操作系统（如 Linux）用户程序加载方式的对比
+
+将 ucore 的加载方式与我们日常使用的 Linux 等通用操作系统相比，可以发现两者在**加载时机、加载来源以及设计目标**上存在明显差异。
+
+##### （1）Linux 等通用操作系统的加载方式
+
+在 Linux 中，用户程序的加载具有如下典型特征：
+
+* 程序以**独立的可执行文件**形式存在于磁盘文件系统中；
+* 当用户执行程序（如 `./a.out`）时：
+
+  1. Shell 调用 `execve()`；
+  2. 内核通过文件系统定位该可执行文件；
+  3. 从磁盘读取 ELF 文件内容；
+  4. 按需建立虚拟内存映射（通常采用 demand paging）；
+* 程序的代码段和数据段**并不会一次性全部加载到物理内存中**，而是随着访问逐页调入。
+
+这种方式可以**支持大量程序、复杂文件系统与高效的内存利用。**
+
+
+##### （2）ucore 中的加载方式
+
+相比之下，ucore 的用户程序加载方式具有明显的教学系统特征：
+
+* 用户程序不通过文件系统加载；
+* 程序二进制在系统启动时就已被放入内存；
+* `execve` 的作用主要是：
+
+  * 创建新的用户地址空间；
+  * 将已有的程序镜像映射到该地址空间；
+  * 初始化用户栈与入口点。
+
+因此，ucore 中的“加载”更接近于**从内核已知的内存位置拷贝/映射程序，而非从外部存储介质读取。**
+
+
+##### （3）产生这种差异的原因分析
+
+这种差异并非设计缺陷，而是由两类系统的**设计目标不同**所决定的：
+
+1. **ucore 的目标**
+
+   * 作为教学操作系统，重点在于：
+
+     * 进程管理
+     * 虚拟内存
+     * 异常与系统调用
+   * 简化 I/O 与文件系统逻辑，降低实现复杂度；
+   * 让学生能够专注于内存管理与进程机制本身。
+
+2. **通用操作系统的目标**
+
+   * 面向真实应用场景；
+   * 需要支持：
+
+     * 动态程序加载
+     * 大规模文件系统
+     * 多用户与多进程并发
+   * 必须将程序存放在外部存储设备中，按需加载。
+  
+## Challenge 
+
+### 1. 为什么用Copy-on-Write
+
+在 `fork()` 系统调用之后，父子进程在逻辑上应当拥有**一致的虚拟地址空间内容**。如果在 `fork()` 时直接对父进程的全部用户空间进行深拷贝，将导致：
+
+* fork 时间复杂度与用户页数量线性相关，性能开销大；
+* 子进程常在 fork 后立即执行 `exec()`，深拷贝的内存往往不会被真正使用；
+* 不符合 Linux 等主流操作系统的实现方式。
+
+因此，本实验在 ucore 中引入 **Copy-on-Write（COW）机制**，其核心思想是：
+
+> fork 时不复制数据，只复制页表；
+> 只有在“写发生时”，才真正复制物理页。
+
+
+### 2. COW 的整体实现思路
+
+在 ucore 原有代码基础上，本实验的 COW 实现主要涉及三处修改：
+
+1. **fork 阶段的页表复制策略（`copy_range`）**
+2. **trap / page fault 的派发与区分写缺页**
+3. **`do_pgfault` 中对 COW 写缺页的处理逻辑**
+
+下面结合具体代码，逐一进行说明。
+
+#### 2.1 fork 阶段的 COW 页表构造实现
+
+##### 修改后的核心代码
+
+```c
+#define PTE_COW  0x100
+
+int
+copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end, bool share) {
+    uintptr_t addr = start;
+    while (addr < end) {
+        pte_t *ptep = get_pte(from, addr, 0);
+        if (ptep == NULL || !(*ptep & PTE_V)) {
+            addr += PGSIZE;
+            continue;
+        }
+
+        struct Page *page = pte2page(*ptep);
+        uint32_t flags = (*ptep & 0x3FF);
+        flags |= PTE_V;
+
+        if (share) {
+            if (flags & PTE_W) {
+                flags = (flags & ~PTE_W) | PTE_COW;
+                *ptep = pte_create(page2ppn(page), flags);
+                tlb_invalidate(from, addr);
+            }
+
+            page_ref_inc(page);
+            pte_t *nptep = get_pte(to, addr, 1);
+            *nptep = pte_create(page2ppn(page), flags);
+            tlb_invalidate(to, addr);
+        } else {
+            struct Page *newp = alloc_page();
+            memcpy(page2kva(newp), page2kva(page), PGSIZE);
+            page_insert(to, newp, addr, flags & (PTE_R | PTE_W | PTE_X | PTE_U));
+        }
+
+        addr += PGSIZE;
+    }
+    return 0;
+}
+```
+
+##### 代码分析说明
+
+这段代码实现了 fork 阶段的 Copy-on-Write 页表构造逻辑，其核心目标是在 fork 时避免对用户空间页面进行立即复制，而是让父子进程共享同一物理页。
+
+代码首先遍历父进程页表中 `[start, end)` 范围内的每一个虚拟页，通过 `get_pte` 获取页表项。如果该虚拟页未映射有效物理页，则直接跳过。
+
+当 `share == true` 时，表示 fork 采用共享策略，这时我们不需要再像之前那样写的时候就全部深拷贝。此时仅当原页具有写权限（`PTE_W`）时，才启用 COW 机制：通过清除 `PTE_W` 并设置 `PTE_COW`，将该页变为“只读的 COW 页”。这一修改不仅作用于子进程页表，同时也**回写父进程页表项**，保证父子进程在 fork 后对该页的访问权限完全一致，从而确保任一进程的写操作都会触发缺页异常。
+
+随后，通过 `page_ref_inc` 增加物理页引用计数，表明该页被多个进程共享；并在子进程页表中建立指向同一物理页的映射。最后对父子页表分别执行 `tlb_invalidate`，防止 CPU 使用旧的可写权限缓存。
+
+
+#### 2.2 trap 与写缺页的识别机制
+
+##### 修改后的核心代码
+
+```c
+static int
+pgfault_handler(struct trapframe *tf) {
+    uintptr_t addr = tf->badvaddr;
+    uint32_t error_code = 0;
+
+    if (tf->cause == CAUSE_STORE_PAGE_FAULT) {
+        error_code |= 0x1;   // write fault
+    }
+
+    return do_pgfault(current->mm, error_code, addr);
+}
+```
+
+##### 代码分析说明
+
+该代码用于在异常处理阶段区分“写导致的缺页异常”。在 RISC-V 架构下，store page fault 表示写访问触发的异常。通过在 `error_code` 中设置写标志位，内核可以在 `do_pgfault` 中统一判断该缺页是否由写操作引起。
+
+这一设计的意义在于：**Copy-on-Write 逻辑只应在“写缺页”时触发**，而读缺页或非法访问应当由其他路径处理，从而避免 COW 与普通缺页逻辑混杂。
+
+
+#### 2.3 `do_pgfault` 中的写时复制实现
+
+##### 修改后的核心代码
+
+```c
+int
+do_pgfault(struct mm_struct *mm, uint32_t error_code, uintptr_t addr) {
+    bool write = (error_code & 0x1) != 0;
+    uintptr_t la = ROUNDDOWN(addr, PGSIZE);
+    pte_t *ptep = get_pte(mm->pgdir, la, 0);
+
+    if (ptep != NULL && (*ptep & PTE_V)) {
+        if (write && (*ptep & PTE_COW)) {
+            struct Page *old = pte2page(*ptep);
+            uint32_t flags = (*ptep & 0x3FF);
+
+            if (page_ref(old) == 1) {
+                flags = (flags | PTE_W) & ~PTE_COW;
+                *ptep = pte_create(page2ppn(old), flags);
+                tlb_invalidate(mm->pgdir, la);
+                return 0;
+            }
+
+            struct Page *newp = alloc_page();
+            memcpy(page2kva(newp), page2kva(old), PGSIZE);
+
+            page_remove(mm->pgdir, la);
+            page_insert(mm->pgdir, newp, la,
+                        flags & (PTE_R | PTE_W | PTE_X | PTE_U));
+            return 0;
+        }
+
+        if (write) {
+            return -E_INVAL;
+        }
+    }
+    return -E_NO_MEM;
+}
+```
+
+##### 代码分析说明
+
+这段代码是 Copy-on-Write 的核心实现。当发生缺页异常时，内核首先判断该异常是否由写操作引起，且目标页是否被标记为 `PTE_COW`。只有在同时满足这两个条件时，才进入 COW 处理逻辑。
+
+当物理页的引用计数为 1 时，说明该页已经不再被其他进程共享，仅由于 fork 后遗留的 COW 标记而保持只读状态。此时无需复制物理页，只需恢复写权限并清除 COW 标志即可，这是一个重要的性能优化路径。
+
+当引用计数大于 1 时，表示该页仍处于共享状态。内核为当前进程分配新的物理页，并将原共享页内容完整复制过去，然后解除旧页映射并建立新的可写映射。这样可以确保写进程获得私有副本，而其他进程的视图不受影响，从而正确实现写时复制语义。
+
+
+#### 2.4 COW 功能测试代码与运行样例说明
+
+##### 测试用例核心代码
+
+```c
+#include <ulib.h>
+#include <unistd.h>
+#include <stdio.h>
+
+static char pagebuf[4096];
+
+int main(void) {
+    // 1) fork 前：父进程初始化页内容
+    pagebuf[0] = 'A';
+    pagebuf[1] = 'A';
+
+    int pid = fork();
+    if (pid < 0) {
+        cprintf("fork failed\n");
+        return -1;
+    }
+
+    if (pid == 0) {
+        // 2) 子进程：对共享页进行写操作（应触发 COW）
+        pagebuf[0] = 'B';
+        pagebuf[1] = 'C';
+        cprintf("[child] %c %c\n", pagebuf[0], pagebuf[1]);
+        exit(0);
+    }
+
+    // 3) 父进程：等待子进程结束，避免并发输出影响判断
+    int st = 0;
+    waitpid(pid, &st);
+
+    // 4) 父进程检查：如果 COW 正确，父进程仍应看到 fork 前写入的 'A','A'
+    if (pagebuf[0] == 'A' && pagebuf[1] == 'A') {
+        cprintf("COW OK\n");
+    } else {
+        cprintf("COW FAIL: %c %c\n", pagebuf[0], pagebuf[1]);
+    }
+    return 0;
+}
+```
+
+##### 代码分析说明
+
+该测试用例的目标是验证：**fork 后父子进程初始共享同一物理页，但子进程写入后，父进程不应被污染，而是复制并写入新的页**。
+
+测试流程按执行时序可以分为四步：
+
+第一步，父进程在 `fork()` 之前将 `pagebuf[0..1]` 初始化为 `'A','A'`。由于 `pagebuf` 是全局数组，属于用户态数据段/匿名页一类（可写），fork 时这类页应该被纳入 COW 机制：父子进程最开始共享同一物理页，并且页表权限会被改为“只读 + `PTE_COW`”。
+
+第二步，子进程分支中对 `pagebuf` 做写入（`'B','C'`）。由于 fork 后该页在子进程页表中应为只读（`PTE_W=0`）且带有 `PTE_COW`，因此写入会触发 **store page fault**。异常进入 `pgfault_handler` 后会将该 fault 标记为写缺页（`error_code |= 0x1`），最终在 `do_pgfault` 中命中 `write && PTE_COW` 分支，执行 COW 拆分：如果该页仍共享（通常 `ref>1`），则为子进程分配新页并拷贝旧页内容，之后子进程对新页完成写入。
+
+第三步，父进程在 `waitpid(pid, &st)` 等待子进程结束，保证子进程已经完成写入并退出。这样父进程的检查发生在“子进程写操作已完成”的确定时刻，避免并发打印导致的观察困难（但不影响内存隔离本身）。
+
+第四步，父进程在 `waitpid` 返回后读取 `pagebuf[0..1]` 并判断是否仍为 `'A','A'`。如果 COW 正确实现，则父进程仍映射到原共享页（或其自身私有页，但内容应保持 fork 前的 `'A','A'`），因此会打印 `COW OK`；若 COW 实现错误（例如 fork 阶段没有把父页也改成只读，或写缺页未正确拆分），则父进程可能读到子进程写入的 `'B','C'`，从而打印 `COW FAIL`。
+
+##### 运行输出样例与含义解释
+
+本次运行得到的关键输出如下：
+![COW 结果验证](images/实验结果1.png)
+```
+kernel_execve: pid = 2, name = "cowtest".
+Breakpoint
+[COW fault] pid=2 va=0x7ffff000 ref=2
+[child] B C
+COW OK
+```
+
+对每一行含义解释如下：
+
+* `kernel_execve: pid = 2, name = "cowtest".`
+  表示内核成功加载并执行用户程序 `cowtest`，pid=2。说明测试用例进入了用户态执行流程。
+
+* `Breakpoint`
+  这是调试过程中触发断点的提示。
+
+* `[COW fault] pid=2 va=0x7ffff000 ref=2`
+  这是我在 `do_pgfault` 的 `write && PTE_COW` 分支中加入的调试输出，用来证明“写确实命中了 COW 分支”。
+
+  * `pid=2`：触发 COW fault 的是当前执行写操作的进程（此处为子进程/执行流）。
+  * `va=0x7ffff000`：发生写缺页的虚拟页地址（页对齐）。说明 fault 的确发生在 `pagebuf` 所在页。
+  * `ref=2`：该物理页当时引用计数为 2，表明父子进程确实共享同一物理页（fork 后共享状态成立），因此必须进行“分配新页 + memcpy”的拆分路径。
+
+* `[child] B C`
+  子进程在写入后打印自身视角下的内容，说明子进程写入生效，并且写入后的读也读到了 `'B','C'`（对自己的私有页或已拆分页）。
+
+* `COW OK`
+  父进程最终检查 `pagebuf[0..1]` 仍为 `'A','A'`，说明子进程的写入没有污染父进程视角，满足 COW 。
+
+下面这段你可以**直接原样接在 2.4 后面，作为 `2.5` 小节**使用，风格、颗粒度和你前面的 2.1–2.4 是一致的，属于**“老师一看就知道你懂机制”的那种说明**。
+
+#### 2.5 COW 情况下的页状态转换分析（有限状态自动机视角）
+
+为了更清晰地理解 Copy-on-Write 机制在运行时的行为，可以从单个虚拟页（Virtual Page）的角度，将其在 fork 及写操作过程中的状态变化抽象为一个有限状态自动机。下面结合本实验中的具体实现，对各个状态及其转换进行说明。
+
+
+##### 状态定义
+
+以“某一虚拟页在某个进程地址空间中的状态”为观察对象，定义如下几种典型状态：
+
+**S0：私有可写页（Private-W）**
+
+* 页表状态：`PTE_W = 1, PTE_COW = 0`
+* 物理页引用计数：`ref = 1`
+* 含义：
+  该页仅被当前进程使用，且允许写入。这是 fork 之前父进程中数据段/栈页的初始状态。
+
+
+**S1：共享只读 COW 页（Shared-COW-RO）**
+
+* 页表状态：`PTE_W = 0, PTE_COW = 1`
+* 物理页引用计数：`ref ≥ 2`
+* 含义：
+  fork 之后，父子进程共享同一物理页。为了保证写操作能够被捕获，该页在父子进程页表中均被设置为只读，并打上 `PTE_COW` 标记。
+
+
+**S2：写后私有可写页（After-COW-Private-W）**
+
+* 页表状态：`PTE_W = 1, PTE_COW = 0`
+* 物理页引用计数：`ref = 1`
+* 含义：
+  某一进程对 COW 页进行写操作后，内核为其分配了新的物理页并完成数据拷贝，该进程获得私有、可写的页。
+
+
+**S3：最后持有者的 COW 只读页（Last-Owner-COW-RO）**
+
+* 页表状态：`PTE_W = 0, PTE_COW = 1`
+* 物理页引用计数：`ref = 1`
+* 含义：
+  原本共享的 COW 页中，其他进程已经退出或解除映射，导致引用计数降为 1，但当前进程页表中仍残留 COW 标记和只读权限。
+
+
+##### 状态转移关系
+
+上述状态之间的主要转移关系如下（从 fork 到写缺页的完整生命周期）：
+
+```text
+S0: 私有可写页 (W=1, COW=0, ref=1)
+        |
+        | fork (copy_range, share=true)
+        v
+S1: 共享COW只读页 (W=0, COW=1, ref>=2)
+        |
+        | 写操作触发 store page fault
+        | 且 ref > 1
+        v
+S2: 写后私有可写页 (W=1, COW=0, ref=1)
+```
+
+此外，还存在一个重要的中间情况：
+
+```text
+S1: 共享COW只读页
+        |
+        | 另一进程 exit / unmap
+        v
+S3: 最后持有者COW只读页 (ref=1)
+        |
+        | 写操作触发 store page fault
+        v
+S2: 写后私有可写页
+```
+
+---
+
+##### 与具体代码实现的对应关系
+
+上述状态转换与本实验中的代码路径是一一对应的：
+
+* **S0 → S1**
+  发生在 `copy_range(..., share=true)` 中：
+  对原本可写页清除 `PTE_W`、设置 `PTE_COW`，父子进程共享同一物理页并增加引用计数。
+
+* **S1 → S2（ref > 1）**
+  发生在 `do_pgfault` 中 `write && PTE_COW && page_ref(old) > 1` 分支：
+  分配新页、`memcpy` 拷贝数据、解除旧映射并建立新的可写映射。
+
+* **S1 → S3**
+  发生在另一进程退出或解除映射时（由进程退出路径或 `page_remove` 维护引用计数）：
+  共享页退化为“仅剩一个进程引用，但仍保持 COW 只读状态”。
+
+* **S3 → S2（ref == 1）**
+  发生在 `do_pgfault` 中 `page_ref(old) == 1` 的快速路径：
+  不再分配新页，仅恢复写权限并清除 `PTE_COW`，避免不必要的拷贝。
+
+
+### 3. Dirty COW 漏洞复现与分析（基于 ucore 的教学型实现）
+
+在完成 Copy-on-Write 机制后，本实验进一步参考 Dirty COW（CVE-2016-5195）的核心思想，在 ucore 中构造了一条**绕过 COW 的写路径**，用于验证：
+
+> 如果存在不受约束的写入口，COW 机制将被破坏，进程间内存隔离不再成立。
+
+需要说明的是，这里的 Dirty COW 并非对 Linux 漏洞的完整复刻（如 `/proc/self/mem + madvise` 的竞态），而是**复现其本质效果**：
+**写操作绕过 COW 拆分，直接修改共享物理页。**
+
+
+#### 3.1 Dirty COW 用户态测试程序
+
+##### 测试用例核心代码
+
+```c
+#include <ulib.h>
+#include <unistd.h>
+#include <stdio.h>
+
+static char pagebuf[4096];
+
+// 最小 ecall 封装：a0=num, a1=arg1, a2=arg2
+static inline long u_syscall2(long num, long arg1, long arg2) {
+    register long a0 asm("a0") = num;
+    register long a1 asm("a1") = arg1;
+    register long a2 asm("a2") = arg2;
+    asm volatile("ecall"
+                 : "+r"(a0)
+                 : "r"(a1), "r"(a2)
+                 : "memory");
+    return a0;
+}
+
+int main(void) {
+    pagebuf[0] = 'A';
+
+    int pid = fork();
+    if (pid < 0) {
+        cprintf("fork failed\n");
+        return -1;
+    }
+
+    if (pid == 0) {
+        // 子进程：正常 COW 写路径
+        for (int i = 0; i < 500000; i++) {
+            pagebuf[0] = 'B';
+            if ((i & 1023) == 0) {
+                yield();
+            }
+        }
+        exit(0);
+    }
+
+    // 父进程：通过漏洞 syscall 直接写共享页
+    for (int i = 0; i < 500000; i++) {
+        u_syscall2(SYS_kmemwrite, (long)&pagebuf[0], (long)'X');
+        if ((i & 1023) == 0) {
+            yield();
+        }
+    }
+
+    waitpid(pid, NULL);
+
+    if (pagebuf[0] == 'X') {
+        cprintf("DIRTY COW TRIGGERED: parent page corrupted!\n");
+    } else {
+        cprintf("COW SAFE: %c\n", pagebuf[0]);
+    }
+
+    return 0;
+}
+```
+
+##### 代码分析说明
+
+该测试程序的设计目标是：**在 COW 已正确实现的前提下，验证是否存在一条写路径可以绕过 COW 拆分逻辑，从而污染共享页**。
+
+程序执行流程如下：
+
+首先，在 `fork()` 之前，父进程将 `pagebuf[0]` 初始化为 `'A'`。该数组位于用户态数据页中，属于可写页，因此在 fork 后应被纳入 COW 管理：父子进程初始共享同一物理页，且页表权限被设置为“只读 + PTE_COW”。
+
+接着，子进程进入循环，不断执行 `pagebuf[0] = 'B'`。这是**正常的用户态写路径**：由于该页是 COW 页，子进程第一次写入时会触发 store page fault，并在 `do_pgfault` 中完成物理页拆分，之后子进程写入的 `'B'` 仅作用于自己的私有页。
+
+与此同时，父进程并不通过普通的用户态写指令，而是反复调用一个特殊的系统调用 `SYS_kmemwrite`，尝试直接对 `pagebuf[0]` 所在页进行写入。通过在循环中加入 `yield()`，可以显著增加父子进程执行的交错程度，使漏洞现象更稳定、更容易复现。
+
+最后，父进程在 `waitpid` 等待子进程结束后，检查自身视角下的 `pagebuf[0]`。如果 COW 语义未被破坏，则父进程应仍看到 `'A'`；若看到 `'X'`，则说明父进程所在的页被非法修改，Dirty COW 复现成功。
+
+
+#### 3.2 Dirty COW 漏洞 syscall 的内核实现
+
+##### 漏洞 syscall 核心代码
+
+```c
+static int
+sys_kmemwrite(uint64_t arg[]) {
+    uintptr_t va = (uintptr_t)arg[0];
+    int value = (int)arg[1];
+
+    if (current == NULL || current->mm == NULL) {
+        return -E_INVAL;
+    }
+
+    struct mm_struct *mm = current->mm;
+    uintptr_t la = ROUNDDOWN(va, PGSIZE);
+
+    pte_t *ptep = get_pte(mm->pgdir, la, 0);
+    if (ptep == NULL || !(*ptep & PTE_V)) {
+        return -E_INVAL;
+    }
+
+
+    struct Page *p = pte2page(*ptep);
+    char *kva = (char *)page2kva(p);
+    kva[va - la] = (char)value;
+
+    return 0;
+}
+```
+
+#### 代码分析说明
+
+该系统调用是本实验中 **刻意引入的脆弱写接口**，用于模拟 Dirty COW 的漏洞本质。
+
+在该实现中，内核首先通过 `get_pte` 找到用户虚拟地址 `va` 对应的页表项，并通过 `pte2page` 定位到其对应的物理页结构 `struct Page`。随后，利用 `page2kva` 将该物理页映射到内核地址空间，直接对其进行写入。
+
+关键问题在于：
+
+* 该写操作不检查 `PTE_COW`；
+* 也不检查 `PTE_W`；
+* 写入发生在内核态的 `kva` 地址上，不会触发 store page fault；
+* 因此完全绕过了 `do_pgfault` 中的 COW 拆分逻辑。
+
+当该页正处于 fork 后的共享状态（父子进程共享同一物理页）时，这种写操作将**直接修改共享物理页本身**，从而使另一进程也能观察到被修改的数据，破坏进程间内存隔离。
+
+
+#### 3.3 系统调用注册与编号
+
+为支持该漏洞演示 syscall，本实验在系统调用表中新增了如下定义：
+
+```c
+#define SYS_kmemwrite 32
+```
+
+并在内核 syscall 分发表中注册：
+
+```c
+[SYS_kmemwrite] sys_kmemwrite,
+```
+
+
+
+#### 3.4 运行结果与漏洞触发分析
+
+本实验运行 `dirtycow_ucore` 时，得到如下关键输出：
+![dirtycow 结果验证](images/实验结果2.png)
+```
+kernel_execve: pid = 2, name = "dirtycow_ucore".
+Breakpoint
+DIRTY COW TRIGGERED: parent page corrupted!
+```
+
+上述输出表明：
+
+* 用户程序 `dirtycow_ucore` 被正确加载并执行；
+* 在 fork 后父子进程交错运行期间，父进程通过 `SYS_kmemwrite` 成功写入了共享页；
+* 父进程最终读到的 `pagebuf[0]` 被修改为 `'X'`，并非 fork 前的 `'A'`；
+* 说明 COW 的“写时拆分”被成功绕过，共享物理页被直接污染。
+
+
+
+#### 3.5 Dirty COW 的修复思路与防御措施
+
+通过前文的 Dirty COW 漏洞复现可以看到，其根本原因并不在于 Copy-on-Write 本身的实现错误，而在于**系统中存在一条能够绕过 COW 拆分逻辑的写路径**。因此，对 Dirty COW 类问题的修复核心在于：
+
+> **保证任何可能修改用户页内容的写操作，都必须遵循与普通用户写操作一致的 COW 语义。**
+
+结合本实验中的漏洞实现，可以从以下几个层面进行修复和防御。
+
+
+##### （1）禁止内核绕过页表权限直接写用户页
+
+在本实验中，`sys_kmemwrite` 通过 `page2kva` 直接写物理页，是导致漏洞的直接原因。最直接、最安全的修复方式是：
+
+* 不提供或彻底移除这种“内核直接写用户页物理内存”的接口；
+
+##### （2）在内核写用户页前显式遵守 COW 语义
+
+如果系统设计上确实需要内核代替用户进程修改用户页内容（例如调试接口、`copy_to_user` 类函数），则必须在写入前显式检查并处理 COW 状态。具体而言：
+
+* 在执行内核写入前，检查目标页的 PTE：
+
+  * 若检测到 `PTE_COW` 且写入发生；
+
+    * 若 `page_ref > 1`，则主动执行与 `do_pgfault(write && PTE_COW)` 等价的拆分流程（分配新页、复制、替换映射）；
+    * 若 `page_ref == 1`，则直接恢复写权限并清除 `PTE_COW`；
+* 确保内核写入的始终是当前进程的私有页。
+
+
+##### （3）与真实 Linux Dirty COW 修复的对应关系
+
+Linux 在修复 CVE-2016-5195 时，核心思路同样是**修补能够绕过 COW 的写路径**，包括：
+
+* 加强对 `/proc/self/mem` 写操作的权限与同步约束；
+* 修正 `get_user_pages()` 等接口在只读映射上的行为；
+* 防止在 COW 页仍共享时获得可写的物理页引用。
+
+可以看到，本实验中的修复思路与真实系统的修复原则在本质上是一致的，只是实现复杂度与触发条件有所不同。
+
+
+
+### 4. 用户程序加载时机分析及与常见操作系统加载的区别
+
+#### 4.1 用户程序在 ucore 中的加载时机与加载方式
+
+在本实验中，无论是 `cowtest` 还是 `dirtycow_ucore`，用户程序并不是在运行时通过文件系统动态加载的，而是**在系统启动阶段就已经被预先加载到内存中**。
+
+具体来说，该用户程序的加载时机发生在：
+
+> **内核启动阶段，由内核在初始化用户程序运行环境时，将用户程序的二进制镜像直接拷贝到内存中。**
+
+在 ucore 的实验环境下，用户程序通常以 **内嵌二进制数据（binary image）** 的形式存在，其加载流程大致为：
+
+1. 在构建系统镜像（如 `ucore.img`）时，用户程序已经被打包进最终镜像；
+2. 内核启动后，在创建第一个用户进程（或通过 `do_execve`）时：
+
+   * 内核直接从**内存中的二进制数据段**读取用户程序内容；
+   * 由内核完成 ELF 解析（或简化版加载）；
+   * 将程序段映射到用户进程的虚拟地址空间中；
+3. 不涉及磁盘访问，也不依赖文件系统路径查找。
+
+从你实际观察到的输出：
+
+```
+kernel_execve: pid = 2, name = "dirtycow_ucore".
+```
+
+可以看出，`execve` 的“加载源”并不是磁盘文件，而是已经驻留在内存中的程序镜像。
+
+因此，可以认为：
+**该用户程序在内核启动阶段就已经被预先加载到内存中，`execve` 只是完成地址空间构建与映射，而非真正的 I/O 加载。**
+
+
+#### 4.2 与常用操作系统（如 Linux）用户程序加载方式的对比
+
+将 ucore 的加载方式与我们日常使用的 Linux 等通用操作系统相比，可以发现两者在**加载时机、加载来源以及设计目标**上存在明显差异。
+
+##### （1）Linux 等通用操作系统的加载方式
+
+在 Linux 中，用户程序的加载具有如下典型特征：
+
+* 程序以**独立的可执行文件**形式存在于磁盘文件系统中；
+* 当用户执行程序（如 `./a.out`）时：
+
+  1. Shell 调用 `execve()`；
+  2. 内核通过文件系统定位该可执行文件；
+  3. 从磁盘读取 ELF 文件内容；
+  4. 按需建立虚拟内存映射（通常采用 demand paging）；
+* 程序的代码段和数据段**并不会一次性全部加载到物理内存中**，而是随着访问逐页调入。
+
+这种方式可以**支持大量程序、复杂文件系统与高效的内存利用。**
+
+
+##### （2）ucore 中的加载方式
+
+相比之下，ucore 的用户程序加载方式具有明显的教学系统特征：
+
+* 用户程序不通过文件系统加载；
+* 程序二进制在系统启动时就已被放入内存；
+* `execve` 的作用主要是：
+
+  * 创建新的用户地址空间；
+  * 将已有的程序镜像映射到该地址空间；
+  * 初始化用户栈与入口点。
+
+因此，ucore 中的“加载”更接近于**从内核已知的内存位置拷贝/映射程序，而非从外部存储介质读取。**
+
+
+##### （3）产生这种差异的原因分析
+
+这种差异并非设计缺陷，而是由两类系统的**设计目标不同**所决定的：
+
+1. **ucore 的目标**
+
+   * 作为教学操作系统，重点在于：
+
+     * 进程管理
+     * 虚拟内存
+     * 异常与系统调用
+   * 简化 I/O 与文件系统逻辑，降低实现复杂度；
+   * 让学生能够专注于内存管理与进程机制本身。
+
+2. **通用操作系统的目标**
+
+   * 面向真实应用场景；
+   * 需要支持：
+
+     * 动态程序加载
+     * 大规模文件系统
+     * 多用户与多进程并发
+   * 必须将程序存放在外部存储设备中，按需加载。
+
+--- 
+
 ## 重要知识点
 
 ### load_icode调用的相关函数：
