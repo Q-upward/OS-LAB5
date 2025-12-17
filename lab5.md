@@ -1891,7 +1891,7 @@ ucore 实验默认运行在单核环境中：
 
 ## 分支任务1：GDB 调试页表查询过程
 
-> 本分支任务的目标：**在 ucore 运行于 QEMU（riscv64）时，通过“套娃式双 GDB”同时调试**  
+> 本分支任务的目标：**在 ucore 运行于 QEMU（riscv64）时，通过“双 GDB”同时调试**  
 > 1）Guest 侧（ucore 内核/指令执行），以及 2）Host 侧（QEMU 源码/MMU 地址翻译），从而观察一次“虚拟地址访问”在 QEMU 中如何进入地址翻译流程，并得到最终的物理地址。
 
 ### 1. 实验背景与要观察的对象
@@ -1899,7 +1899,7 @@ ucore 实验默认运行在单核环境中：
 在启用虚拟内存（SV39）后，CPU 执行取指/Load/Store 时产生的是**虚拟地址（VA）**。真实硬件通常按如下逻辑完成转换：
 
 1. **先查 TLB**（转址旁路缓存）：若命中，直接得到物理页帧号（PPN），拼上页内偏移形成 PA。  
-2. **TLB miss**：硬件根据 `satp` 中的页表根地址，按 SV39 的三级索引逐级读取页表项（PTE），完成页表遍历（page-table walk）。  
+2. **TLB miss**：硬件根据 `satp` 中的页表根地址，按 SV39 的三级索引逐级读取页表项（PTE），完成页表遍历。  
 3. 得到映射后，**填充/更新 TLB**，并继续完成本次访存。
 
 在本实验中，硬件行为由 QEMU 用软件模拟。也就是说，“TLB 查询、页表遍历、权限检查、形成物理地址”等关键步骤，会在 **QEMU 的 C 代码中**出现并可被 GDB 断点/单步观察。
@@ -1947,7 +1947,7 @@ sudo gdb
 (gdb) attach <PID>
 ```
 
-3）避免被 SIGPIPE 等信号频繁打断（调试实践中非常常用）：
+3）避免被 SIGPIPE 等信号频繁打断：
 
 ```gdb
 (gdb) handle SIGPIPE nostop noprint
@@ -1983,7 +1983,7 @@ sudo gdb
 ```gdb
 (gdb) bt
 ```
-bt 会显示当前停在 get_physical_address（#0），以及上层调用路径（本次包含 riscv_cpu_get_phys_page_debug / cpu_get_phys_page_attrs_debug / gdbstub.c ... 等）。
+bt 会显示当前停在 get_physical_address（#0），以及上层调用路径。
 
 8）为了定位源码位置并确认函数签名，在断点处查看源码片段（或函数定义附近）：
 ```gdb
@@ -2024,9 +2024,9 @@ si 会执行一条指令并停住。通过反复 si，就能控制 ucore 精确�
 
 #### 4.1 图1：QEMU-gdb 的调用栈 `bt`
 
-```markdown
+
 ![QEMU-gdb backtrace：进入地址翻译入口的调用路径](images/fig_qemu_backtrace.png)
-```
+
 
 从 backtrace 可以看到当前停在：
 
@@ -2054,9 +2054,9 @@ si 会执行一条指令并停住。通过反复 si，就能控制 ucore 精确�
 
 #### 4.2 图2：QEMU-gdb 命中 `get_physical_address`，打印虚拟地址 `addr`
 
-```markdown
+
 ![QEMU-gdb：命中 get_physical_address 并打印 addr（虚拟地址）](images/fig_qemu_get_physical_address.png)
-```
+
 
 截图中可以看到：
 
@@ -2072,9 +2072,9 @@ si 会执行一条指令并停住。通过反复 si，就能控制 ucore 精确�
 
 #### 4.3 图3：QEMU 源码定位（`list` 查看 `get_physical_address` 的定义处）
 
-```markdown
+
 ![QEMU 源码定位：get_physical_address 定义位置（cpu_helper.c）](images/fig_qemu_get_physical_address_code.png)
-```
+
 
 截图显示 `get_physical_address` 定义在：
 
@@ -2096,9 +2096,9 @@ si 会执行一条指令并停住。通过反复 si，就能控制 ucore 精确�
 
 #### 4.4 图4：Guest 侧（ucore-gdb）定位到 `kern_init` 并看到访存指令 `sd ra,8(sp)`
 
-```markdown
+
 ![ucore-gdb：kern_init 附近指令，包含 sd ra,8(sp) 访存写栈](images/fig_ucore_sd_ra.png)
-```
+
 
 截图显示：
 
@@ -2120,9 +2120,9 @@ si 会执行一条指令并停住。通过反复 si，就能控制 ucore 精确�
 
 #### 4.5 图5：QEMU-gdb 打印 `access_type`、`addr` 与 `physical`（证明 VA→PA）
 
-```markdown
+
 ![QEMU-gdb：access_type 与 VA/PA（addr/physical）](images/fig_va_to_pa.png)
-```
+
 
 截图显示：
 
@@ -2136,7 +2136,7 @@ si 会执行一条指令并停住。通过反复 si，就能控制 ucore 精确�
 2. **虚拟地址 `addr` 与物理地址 `physical` 同时可见**：这直接证明 QEMU 的地址翻译函数将 VA 成功转换为 PA。  
 3. 即使本次触发路径与 gdbstub 插入断点有关，但它调用到的翻译实现与普通访存共享同一套机制，因此该结果可作为“地址翻译确实发生”的证据。
 
-### 6. 小结
+### 5. 小结
 
 本次分支任务通过“三终端 + 双 GDB”完成了对 QEMU 中地址翻译入口的定位与观测：
 
