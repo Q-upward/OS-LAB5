@@ -1965,8 +1965,31 @@ sudo gdb
 ```gdb
 (gdb) p/x addr
 ```
+在我的调试中，addr 输出为 0xffffffffc020004a，与 Guest 侧 kern_init 的入口地址一致，说明这次断点确实对应 ucore 的一次真实取指/访存触发的地址翻译。
 
----
+5）查看本次访问类型 access_type（用于区分 取指 / Load / Store）：
+```gdb
+(gdb) p access_type
+```
+本次输出为 0，可将其理解为“取指”场景：CPU 需要从 addr 对应的虚拟地址取出指令，因此触发翻译。
+
+6）查看翻译得到的 物理地址：
+```gdb
+(gdb) p/x physical
+```
+可以观察到，QEMU 在 get_physical_address 中最终给出了 addr(虚拟) 对应的 physical(物理)，从现象上完成了 “VA → PA” 的映射结果输出。
+
+7）为了梳理“翻译入口是从哪里被调用到的”，打印调用栈：
+```gdb
+(gdb) bt
+```
+bt 会显示当前停在 get_physical_address（#0），以及上层调用路径（本次包含 riscv_cpu_get_phys_page_debug / cpu_get_phys_page_attrs_debug / gdbstub.c ... 等）。
+
+8）为了定位源码位置并确认函数签名，在断点处查看源码片段（或函数定义附近）：
+```gdb
+(gdb) list
+```
+可看到 get_physical_address 位于 target/riscv/cpu_helper.c，并能确认其参数含义（addr / physical / prot / access_type / mmu_idx），从而把“观察到的现象”与“源码中的入口函数”对应起来。
 
 #### 3.3 终端3：连接 gdbstub 并定位到具体访存/取指点
 
@@ -1990,6 +2013,11 @@ make gdb
 
 可以看到 `kern_init` 入口附近的函数序言与初始化代码，其中包含典型访存指令：`sd ra,8(sp)`。
 
+为了让执行推进到某条特定指令位置（例如看到/走过 sd ra,8(sp)），使用单步指令：
+```gdb
+(gdb) si
+```
+si 会执行一条指令并停住。通过反复 si，就能控制 ucore 精确走到/走过某条访存指令，从而在 Host 侧（终端2）触发并捕获对应的地址翻译过程。
 
 ### 4. 关键截图与现象分析
 
