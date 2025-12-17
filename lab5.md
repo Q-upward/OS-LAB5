@@ -1889,6 +1889,234 @@ ucore 实验默认运行在单核环境中：
 **理解与差异：**  
 实验适合教学和理解基本机制，而 OS 原理中的多核设计则是对这些机制的“扩展版与强化版”，复杂度显著提升。
 
+## 分支任务1：GDB 调试页表查询过程
+
+> 本分支任务的目标：**在 ucore 运行于 QEMU（riscv64）时，通过“套娃式双 GDB”同时调试**  
+> 1）Guest 侧（ucore 内核/指令执行），以及 2）Host 侧（QEMU 源码/MMU 地址翻译），从而观察一次“虚拟地址访问”在 QEMU 中如何进入地址翻译流程，并得到最终的物理地址。
+
+### 1. 实验背景与要观察的对象
+
+在启用虚拟内存（SV39）后，CPU 执行取指/Load/Store 时产生的是**虚拟地址（VA）**。真实硬件通常按如下逻辑完成转换：
+
+1. **先查 TLB**（转址旁路缓存）：若命中，直接得到物理页帧号（PPN），拼上页内偏移形成 PA。  
+2. **TLB miss**：硬件根据 `satp` 中的页表根地址，按 SV39 的三级索引逐级读取页表项（PTE），完成页表遍历（page-table walk）。  
+3. 得到映射后，**填充/更新 TLB**，并继续完成本次访存。
+
+在本实验中，硬件行为由 QEMU 用软件模拟。也就是说，“TLB 查询、页表遍历、权限检查、形成物理地址”等关键步骤，会在 **QEMU 的 C 代码中**出现并可被 GDB 断点/单步观察。
+
+本次调试我选择观察一个非常稳定的虚拟地址访问：**进入内核 C 入口 `kern_init` 时的取指访问**，以及在 ucore 侧看到的一条典型访存指令 **`sd ra, 8(sp)`**。
+
+
+### 2. 双重 GDB（套娃式）调试架构与三个终端分工
+
+为了同时观察 “Guest 指令执行” 与 “Host 模拟硬件地址翻译”，使用三个终端：
+
+- **终端1（运行 QEMU）**：启动运行 ucore 的 QEMU（调试版，带符号/源码信息），让系统跑起来。  
+- **终端2（Host 侧 GDB）**：使用系统自带 **x86_64 gdb** `attach` 到 QEMU 进程，调试 QEMU 源码，重点关注地址翻译入口函数与调用路径。  
+- **终端3（Guest 侧 GDB）**：使用 `riscv64-unknown-elf-gdb` 连接 QEMU 的 gdbstub（`localhost:1234`），调试 ucore 内核，控制/查看 RISC-V 指令、寄存器与 PC。
+
+这套架构的核心好处是：  
+- 终端3 可以让 ucore **停在某条指令附近**（例如 `sd ra,8(sp)`）；  
+- 终端2 可以让 QEMU **停在地址翻译相关的 C 代码**（例如 `get_physical_address`），从而把“访存触发 → 翻译发生”的链路对齐。
+
+### 3. 实验步骤与关键命令
+
+#### 3.1 终端1：启动调试版 QEMU
+
+在 ucore 实验目录执行：
+
+```bash
+make debug
+```
+
+QEMU 启动后会打印 OpenSBI 与 ucore 初始化信息，并最终跑到测试结束。
+
+
+#### 3.2 终端2：attach QEMU 并在翻译入口下断点
+
+1）先找到 QEMU 进程 PID：
+
+```bash
+pgrep -f qemu-system-riscv64
+```
+
+2）进入 gdb 并 attach：
+
+```bash
+sudo gdb
+(gdb) attach <PID>
+```
+
+3）避免被 SIGPIPE 等信号频繁打断（调试实践中非常常用）：
+
+```gdb
+(gdb) handle SIGPIPE nostop noprint
+```
+
+4）在 QEMU 侧地址翻译入口处下断点并继续执行：
+
+```gdb
+(gdb) b get_physical_address
+(gdb) c
+```
+
+当 QEMU 执行到需要翻译的虚拟地址访问时，会命中断点并停住。随后打印被翻译的虚拟地址：
+
+```gdb
+(gdb) p/x addr
+```
+
+---
+
+#### 3.3 终端3：连接 gdbstub 并定位到具体访存/取指点
+
+```bash
+make gdb
+```
+
+进入 `riscv64-unknown-elf-gdb` 后：
+
+```gdb
+(gdb) target remote localhost:1234
+(gdb) b kern_init
+(gdb) c
+```
+
+停住后查看当前 PC 附近指令：
+
+```gdb
+(gdb) x/8i $pc
+```
+
+可以看到 `kern_init` 入口附近的函数序言与初始化代码，其中包含典型访存指令：`sd ra,8(sp)`。
+
+
+### 4. 关键截图与现象分析
+
+
+#### 4.1 图1：QEMU-gdb 的调用栈 `bt`
+
+```markdown
+![QEMU-gdb backtrace：进入地址翻译入口的调用路径](images/fig_qemu_backtrace.png)
+```
+
+从 backtrace 可以看到当前停在：
+
+- `#0 get_physical_address(...)`（地址翻译入口）
+- 上层调用链依次经过：
+  - `riscv_cpu_get_phys_page_debug`
+  - `cpu_get_phys_page_attrs_debug`
+  - `breakpoint_invalidate`
+  - `cpu_breakpoint_insert`
+  - `gdb_breakpoint_insert`
+  - `handle_insert_bp`
+  - `process_string_cmd`
+  - `run_cmd_parser`
+  - `gdb_handle_packet`
+  - `gdb_read_byte`
+  - `gdb_chr_receive`
+
+**分析要点：**
+
+1. **`get_physical_address` 是本次观察的“翻译核心入口”**：它接收 `addr`（虚拟地址）、`access_type`（访问类型：取指/读/写）等信息，并最终给出 `physical`（物理地址）与 `prot`（权限/属性）。  
+2. 调用链中大量出现 `gdbstub.c`、`gdb_handle_packet`、`breakpoint_insert` 等函数，说明本次触发翻译的路径与 **QEMU 的 gdbstub 处理断点/插入断点**有关。换句话说：  
+   - 我们在 Guest 侧（终端3）对 `kern_init` 下断点，QEMU 需要把这个断点地址转换成物理执行环境可用的形式，于是触发了 `cpu_get_phys_page_*` 与 `get_physical_address`。  
+3. 这条调用链虽然不是“普通 Load/Store 的最短链路”，但它仍然真实地走到了 **同一套地址翻译实现**（同一个 `get_physical_address`），因此同样能用于观察“VA → PA”。
+
+
+#### 4.2 图2：QEMU-gdb 命中 `get_physical_address`，打印虚拟地址 `addr`
+
+```markdown
+![QEMU-gdb：命中 get_physical_address 并打印 addr（虚拟地址）](images/fig_qemu_get_physical_address.png)
+```
+
+截图中可以看到：
+
+- 命中断点：`Thread ... hit Breakpoint 1, get_physical_address(...)`
+- 随后 `p/x addr` 输出：`0xffffffffc020004a`
+
+**分析要点：**
+
+1. 该 `addr` 是一个高地址（以 `0xffffffff...` 开头），符合 ucore 内核映射常见布局：内核在高半区运行，使用虚拟地址访问代码与数据。  
+2. 这个值与 Guest 侧 `kern_init` 的入口地址一致（见图4），说明我们捕获到的翻译对象确实是 **内核入口处的取指/相关访问**。  
+3. 这一步非常关键：它把“QEMU 侧的翻译入口”与“Guest 侧的具体代码位置（PC）”对齐起来，证明我们不是随便断在某个函数，而是断在**与 ucore 执行直接相关**的位置。
+
+
+#### 4.3 图3：QEMU 源码定位（`list` 查看 `get_physical_address` 的定义处）
+
+```markdown
+![QEMU 源码定位：get_physical_address 定义位置（cpu_helper.c）](images/fig_qemu_get_physical_address_code.png)
+```
+
+截图显示 `get_physical_address` 定义在：
+
+- `/root/qemu-4.1.1/target/riscv/cpu_helper.c`
+- 附近是函数签名与注释
+
+**分析要点：**
+
+1. 通过断点定位源码文件与行号，确认 **RISC-V 的地址翻译实现**主要在 `target/riscv/` 目录（目标架构相关实现），并集中于 `cpu_helper.c` 等文件中。  
+2. `get_physical_address` 的参数中出现：
+   - `target_ulong addr`：待翻译虚拟地址  
+   - `hwaddr *physical`：输出物理地址指针  
+   - `int *prot`：输出权限/属性  
+   - `int access_type`：访问类型（取指/读/写）  
+   - `int mmu_idx`：MMU 上下文索引（与特权级/地址空间属性相关）  
+3. 虽然本截图并未展示完整页表遍历细节，但已经把“翻译入口在哪个文件/函数”钉死，便于后续继续深入（例如继续 `step/next` 观察内部 TLB 查询与 page-table walk）。
+
+
+
+#### 4.4 图4：Guest 侧（ucore-gdb）定位到 `kern_init` 并看到访存指令 `sd ra,8(sp)`
+
+```markdown
+![ucore-gdb：kern_init 附近指令，包含 sd ra,8(sp) 访存写栈](images/fig_ucore_sd_ra.png)
+```
+
+截图显示：
+
+- 断在 `kern_init`（`kern/init/init.c:22`）
+- `x/8i $pc` 列出多条指令，其中包含：
+  - `addi sp,sp,-16`（调整栈空间）
+  - **`sd ra,8(sp)`（把返回地址寄存器 ra 写入栈内存）**
+  - `jal ... <memset>` 等
+
+**分析要点：**
+
+1. `sd ra,8(sp)` 是**典型 store 指令**，语义是：把寄存器 `ra` 的 8 字节内容写到虚拟地址 `(sp + 8)`。  
+2. 在开启虚拟内存后，`sp` 是虚拟地址空间中的栈指针，因此 `sd` 会触发一次“对虚拟地址的写访问”，需要 MMU（此处由 QEMU 模拟）完成地址翻译。  
+3. 因此 `sd ra,8(sp)` 可以作为一个“稳定的访存触发点”：  
+   - 如果我们在 QEMU 侧对 `get_physical_address` 设置条件断点（例如当 `access_type` 表示写访问且 `addr` 落在某个栈页范围时停下），就能观察到更接近“真实 Store 访存”的翻译路径。
+
+> 备注：本次截图主要用于证明：Guest 侧确实存在会触发地址翻译的访存指令（store），并且我们能精确定位其地址与上下文。
+
+
+#### 4.5 图5：QEMU-gdb 打印 `access_type`、`addr` 与 `physical`（证明 VA→PA）
+
+```markdown
+![QEMU-gdb：access_type 与 VA/PA（addr/physical）](images/fig_va_to_pa.png)
+```
+
+截图显示：
+
+- `p access_type` 输出：`0`
+- `p/x addr` 输出：`0xffffffffc020004a`（虚拟地址）
+- `p/x physical` 输出：`0x7ffc8fc35ee8`（物理地址）
+
+**分析要点：**
+
+1. **访问类型 `access_type=0`**：表明本次触发翻译的是一种特定访问类别（在 QEMU 的实现中常用来区分取指/读/写）。结合本次对 `kern_init` 的定位，可合理解释为：这是与 **取指（instruction fetch）或调试断点相关的执行访问**。  
+2. **虚拟地址 `addr` 与物理地址 `physical` 同时可见**：这直接证明 QEMU 的地址翻译函数将 VA 成功转换为 PA。  
+3. 即使本次触发路径与 gdbstub 插入断点有关，但它调用到的翻译实现与普通访存共享同一套机制，因此该结果可作为“地址翻译确实发生”的证据。
+
+### 6. 小结
+
+本次分支任务通过“三终端 + 双 GDB”完成了对 QEMU 中地址翻译入口的定位与观测：
+
+- Guest 侧能精确定位到内核入口与典型访存指令（`sd ra,8(sp)`）；  
+- Host 侧成功在 `get_physical_address` 命中断点，并打印出 **VA（addr）与 PA（physical）**，以及访问类型 `access_type`；  
+- 通过 backtrace 得到了进入翻译入口的调用路径，验证了“ucore 的虚拟地址访问确实驱动了 QEMU 的翻译流程”。
+
+这为进一步深入理解 SV39 页表查询、TLB miss 处理和权限检查提供了可复现的调试框架。
 
 
 ## 分支任务 2：基于双重 GDB 的 QEMU 中 ecall / sret 指令处理流程分析
